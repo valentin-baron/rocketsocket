@@ -212,7 +212,6 @@ pub mod option {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize as _;
 
     fn parse(json: &str) -> Timestamp {
         serde_json::from_str(json).unwrap()

@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn is_send_and_sync_even_for_a_non_send_marker() {
         // The marker is phantom, so auto traits must not depend on it.
-        struct NotSend(*const ());
+        struct NotSend(#[expect(dead_code)] *const ());
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Id<NotSend>>();
     }
