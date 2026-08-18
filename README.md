@@ -20,3 +20,6 @@ divergences).
   of rotting.
 - **Events as a `Stream` first**, with an `EventHandler` trait generated from the same
   declaration list.
+- **discord.py-shaped ergonomics on top**: `#[event]` / `#[command]` / `#[cog]` proc macros,
+  extractor-style parameters, and live entities (`msg.reply(..)`) — all strictly optional
+  sugar over the raw API. See [docs/dx.md](docs/dx.md).
