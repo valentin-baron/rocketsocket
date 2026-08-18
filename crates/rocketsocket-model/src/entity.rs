@@ -29,7 +29,8 @@
 //! - [`Message::bot`] is deprecated and is not set for messages from users holding the `bot`
 //!   role. See its documentation.
 //! - [`Room::sys_mes`] is `bool | MessageType[]`, and [`Room::role_priorities_created`] is
-//!   `bool | number`. Both are modelled as untagged enums.
+//!   `bool | number`. Both are modelled as untagged enums. Only the array arm of `sysMes`
+//!   means anything to the server — see [`SysMes`].
 //! - [`PresenceStatus`] arrives as an integer on the presence stream, and `0` is ambiguous:
 //!   it means both "offline" and "disabled".
 //! - `IUser.services` is deliberately not modelled. See [`User`].
@@ -437,7 +438,9 @@ wire_enum! {
 /// distinction is not recoverable from the presence stream. Use the user document's
 /// `status` field if you need to tell them apart.
 ///
-/// Encoding is lossless, including for [`PresenceStatus::Unknown`].
+/// A decoded value re-encodes to the exact integer it came from, including for
+/// [`PresenceStatus::Unknown`]. (A hand-built `Unknown(0..=3)` is the one value that does
+/// not survive a round trip, because those codes decode to their named variants.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(from = "u8", into = "u8")]
 #[non_exhaustive]
@@ -518,8 +521,13 @@ impl From<PresenceStatus> for u8 {
 /// source, imports and app-authored messages have produced stubs without it, and DDP
 /// `changed` frames can deliver a partial `u`. Only `_id` is required here.
 ///
-/// `name` may be **absent or explicitly `null`** — the server unsets it rather than deleting
-/// the key when a user clears their display name. Both decode to `None`.
+/// `name` may be **absent or explicitly `null`**, and which one you get depends on the code
+/// path that built the stub, not on anything meaningful. The message factories copy it
+/// unconditionally (`u: {_id, username, name: user.name}` in both `prepareMessageObject` and
+/// `Messages.createWithTypeRoomIdMessageUserAndUnread`), and the workspace runs the Mongo
+/// driver with `ignoreUndefined: false`, so a user with no real name is persisted as
+/// `name: null`. Other factories guard the key (`...(user.name && { name: user.name })`) and
+/// leave it out entirely. Both decode to `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserRef {
     /// The user's id.
@@ -654,8 +662,14 @@ impl Reaction {
 /// One entry of [`Message::starred`].
 ///
 /// Starring is per-user and private, so this is a list of the users who starred the message —
-/// **not** a boolean. A payload delivered to one user only ever contains that user's own
-/// entry, which is why the field is so easy to mistake for a flag.
+/// **not** a boolean.
+///
+/// How much of that list you see depends on where the payload came from. REST responses and
+/// the `loadHistory` method run it through `normalizeMessagesForUser`
+/// (`apps/meteor/server/lib/utils/lib/normalizeMessagesForUser.ts`), which strips every entry
+/// but the recipient's own — which is why the field is so easy to mistake for a flag. A
+/// `stream-room-messages` frame gets no such treatment: `watch.messages` broadcasts the raw
+/// document, so the list there names **every** user who starred the message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Star {
     /// Id of the user who starred the message.
@@ -887,6 +901,11 @@ impl Message {
     /// True for any message carrying a `t`, including one whose type this crate does not
     /// recognise — an unknown `t` is still a system message and rendering `msg` as prose
     /// would be wrong.
+    ///
+    /// This is deliberately wider than the server's own `isSystemMessage`, which additionally
+    /// requires `t` to be in the current `MessageTypes` list and therefore answers `false` for
+    /// the retired types (`jitsi_call_started`, `otr`, `voip-call-*`, …) that production
+    /// databases are still full of.
     #[must_use]
     pub fn is_system(&self) -> bool {
         self.t.is_some()
@@ -900,9 +919,15 @@ impl Message {
 
     /// Whether this is a deletion tombstone.
     ///
-    /// When `Message_KeepHistory` is on, deleting a message rewrites it in place with
-    /// `t = "rm"` and an `editedAt` rather than removing the document. Such a message still
-    /// arrives on the stream as a normal update and must not be rendered.
+    /// The setting that produces one is **`Message_ShowDeletedStatus`**, not
+    /// `Message_KeepHistory`: `deleteMessage` calls `Messages.setAsDeletedByIdAndUser`, which
+    /// rewrites the document in place with `t = "rm"`, an empty `msg`, an `editedAt` and an
+    /// `editedBy`. A thread parent (`tcount > 0`) is tombstoned unconditionally, whatever the
+    /// settings say. `Message_KeepHistory` on its own does something different — it sets
+    /// `_hidden: true` and leaves the body intact, so [`Message::hidden`] is the flag to check
+    /// for that case.
+    ///
+    /// A tombstone arrives on the stream as an ordinary update and must not be rendered.
     #[must_use]
     pub fn is_deleted_tombstone(&self) -> bool {
         self.is_edited() && self.t.as_ref() == Some(&MessageType::Rm)
@@ -914,10 +939,16 @@ impl Message {
         self.tmid.is_some()
     }
 
-    /// Whether this message is the root of a thread that has replies.
+    /// Whether this message is the root of a thread.
+    ///
+    /// Mirrors the server's `isThreadMainMessage`, which tests for the *presence* of both
+    /// `tcount` and `tlm` rather than for a positive count. The distinction is real:
+    /// `Messages.decreaseReplyCountById` only `$inc`s `tcount`, it never unsets it, so a
+    /// thread whose replies have all been deleted keeps `tcount: 0` alongside its `tlm` and is
+    /// still a thread as far as the server and the thread list are concerned.
     #[must_use]
     pub fn is_thread_main(&self) -> bool {
-        self.tcount.is_some_and(|count| count > 0)
+        self.tcount.is_some() && self.tlm.is_some()
     }
 
     /// Whether a discussion was created from this message.
@@ -928,8 +959,9 @@ impl Message {
 
     /// Whether `user` starred this message.
     ///
-    /// Only meaningful on a payload delivered to that same user: the server projects
-    /// `starred` per recipient.
+    /// Safe on any payload, but note what the list contains: on a REST payload the server has
+    /// already filtered `starred` down to the recipient, while on a `stream-room-messages`
+    /// frame it holds every user who starred the message. See [`Star`].
     #[must_use]
     pub fn is_starred_by(&self, user: &UserId) -> bool {
         self.starred.as_ref().is_some_and(|stars| stars.iter().any(|star| star.user_id == *user))
@@ -954,11 +986,24 @@ impl Message {
 
 /// The `sysMes` field of a [`Room`], which is two different things wearing one name.
 ///
-/// - `false` hides *all* system messages in the room; `true` shows all of them.
-/// - an array lists the system message types to **hide**, leaving the rest visible.
+/// - an array lists the system message types to **hide** in this room, leaving the rest
+///   visible;
+/// - a boolean configures *nothing*.
 ///
-/// The server treats "absent" as "show everything", and only an array is consulted by
-/// `getHiddenSystemMessages`; a boolean falls back to the workspace-wide default list.
+/// The boolean arm is the trap. Both the server (`getHiddenSystemMessages`) and the client
+/// (`useMessages`) do the same thing with this field:
+///
+/// ```text
+/// Array.isArray(room.sysMes) ? room.sysMes : <workspace Hide_System_Messages>
+/// ```
+///
+/// so `sysMes: false` does **not** hide everything and `sysMes: true` does not show
+/// everything — a non-array value, exactly like an absent one, simply defers to the
+/// workspace-wide `Hide_System_Messages` list, which this crate cannot see.
+///
+/// A current server never writes a boolean: `Rooms.setSystemMessagesById` stores a non-empty
+/// array and `$unset`s the field otherwise. The booleans in the wild come from the Apps
+/// engine, which maps its `displaySystemMessages` flag straight onto `sysMes`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 #[non_exhaustive]
@@ -979,14 +1024,16 @@ impl SysMes {
         }
     }
 
-    /// Whether `t` is hidden in this room.
+    /// Whether `t` is hidden **by this room's own configuration**.
     ///
-    /// `Enabled(false)` hides everything; `Enabled(true)` hides nothing *here* and defers to
-    /// the workspace default, which this crate cannot see.
+    /// Only [`SysMes::Hidden`] can answer `true`. Both boolean arms answer `false`, because
+    /// the server ignores them and falls back to the workspace-wide `Hide_System_Messages`
+    /// list — which this crate cannot see, so a `false` here means "this room hides nothing
+    /// extra", not "this type is visible".
     #[must_use]
     pub fn hides(&self, t: &MessageType) -> bool {
         match self {
-            Self::Enabled(enabled) => !enabled,
+            Self::Enabled(_) => false,
             Self::Hidden(types) => types.contains(t),
         }
     }
@@ -1019,7 +1066,8 @@ pub struct AnnouncementDetails {
 /// Only [`Room::id`], [`Room::updated_at`] and [`Room::t`] are guaranteed. In particular
 /// [`Room::msgs`] and [`Room::users_count`] are declared non-optional by `core-typings` but
 /// are absent from several stream projections, and [`Room::u`] does not exist at all on
-/// direct message rooms (`IDirectMessageRoom` omits it).
+/// direct message rooms (`IDirectMessageRoom` omits it) or on omnichannel rooms (the server's
+/// own room factory carries a `TODO: Solve 'u' missing issue` where it should be).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Room {
@@ -1032,7 +1080,8 @@ pub struct Room {
     /// Room kind.
     pub t: RoomType,
 
-    /// URL-safe room name. Absent on direct message rooms.
+    /// URL-safe room name. Absent on direct message rooms and on omnichannel rooms, which
+    /// carry only an `fname` taken from the contact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Display name, which may differ from `name` when `UI_Allow_room_names_with_special_chars`
@@ -1049,7 +1098,7 @@ pub struct Room {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub users_count: Option<i64>,
 
-    /// The room's owner stub. Absent on direct message rooms.
+    /// The room's owner stub. Absent on direct message and omnichannel rooms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub u: Option<UserRef>,
     /// Participant ids. Set on direct message rooms; `len() > 2` means a multi-user DM.
@@ -1235,8 +1284,13 @@ pub struct Room {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sla_id: Option<String>,
     /// SLA due time, in minutes.
+    ///
+    /// Copied verbatim from the SLA policy's `dueTimeInMinutes`, which is **not constrained to
+    /// an integer** anywhere: the REST schema types it as a bare `number` and the admin form
+    /// only validates `> 0`, so `1.5` is an accepted policy and reaches this field — and this
+    /// field *is* in the `roomFields` projection. Hence `f64`, not an integer type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub estimated_waiting_time_queue: Option<i64>,
+    pub estimated_waiting_time_queue: Option<f64>,
     /// Linked contact record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_id: Option<String>,
@@ -1313,8 +1367,12 @@ pub struct OldRoomKey {
 /// This is the document that drives the sidebar: unread counts, mention badges, mute
 /// settings, drafts and the E2E key are all here rather than on the [`Room`].
 ///
-/// The mandatory set matches `subscriptionFields` in `publishFields.ts`: id, `_updatedAt`,
-/// `rid`, `u`, `t`, `ts`, `name`, `open`, `unread`, `userMentions` and `groupMentions`.
+/// The mandatory set is `_id`, `_updatedAt`, `rid`, `u`, `t`, `ts`, `open`, `unread`,
+/// `userMentions` and `groupMentions` — all of them projected by `subscriptionFields` in
+/// `publishFields.ts` and all of them written by every subscription factory.
+///
+/// [`Subscription::name`] is *not* in that set despite being `name: string` in
+/// `core-typings`; see its documentation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Subscription {
@@ -1333,7 +1391,18 @@ pub struct Subscription {
     /// When the subscription was created.
     pub ts: Timestamp,
     /// Room name as this user sees it. For a DM this is the other participant's username.
-    pub name: String,
+    ///
+    /// Declared `name: string` by `core-typings`, but the server can and does persist it as
+    /// **`null`**. `Subscriptions.createWithRoomAndUser` copies `name: room.name`
+    /// unconditionally, the workspace runs the Mongo driver with `ignoreUndefined: false` (so
+    /// an absent `room.name` is stored as an explicit null rather than dropped), and an
+    /// omnichannel room has no `name` at all. Joining a livechat room — `GET
+    /// /v1/livechat/room.join`, which routes to `addUserToRoom` → `Room.createUserSubscription`
+    /// → `createWithRoomAndUser` without supplying a `name` for a non-`d` room — produces
+    /// exactly that document, and `subscriptionFields` projects `name`, so it reaches the
+    /// stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Whether the room is open in this user's sidebar.
     pub open: bool,
     /// Unread message count.
@@ -1543,9 +1612,17 @@ impl Subscription {
     }
 
     /// The name to show, preferring the display name.
+    ///
+    /// `None` only when neither field survived — an omnichannel subscription created by
+    /// joining a nameless livechat room has a null [`Subscription::name`] and no `fname`.
+    ///
+    /// Note that this is *not* what the server renders for a direct message: `direct.ts`'s
+    /// `roomName` returns `fname` only when `UI_Use_Real_Name` is on and falls back to `name`
+    /// otherwise, so on a workspace configured to show usernames this method prefers the wrong
+    /// one. It has no access to that setting; a caller that cares must pick the field itself.
     #[must_use]
-    pub fn display_name(&self) -> &str {
-        self.fname.as_deref().unwrap_or(&self.name)
+    pub fn display_name(&self) -> Option<&str> {
+        self.fname.as_deref().or(self.name.as_deref())
     }
 }
 
@@ -1585,9 +1662,18 @@ pub struct UserEmail {
 /// # What is guaranteed
 ///
 /// Only [`User::id`]. `core-typings` declares `_updatedAt`, `createdAt`, `roles`, `type` and
-/// `active` non-optional, but every one of them is dropped by real projections — the streamer's
-/// own user cache projects `{_id: 1, roles: 1}`, and `Users:NameChanged` carries only
-/// `{_id, name, username}`. Presence updates arrive as partial diffs too.
+/// `active` non-optional, but real payloads drop them: `Users:NameChanged` carries only
+/// `{_id, name, username}`, and REST projections are narrower still.
+///
+/// # This type does not model a `userData` diff
+///
+/// The `stream-notify-user` `userData` event does not carry a user document on an update. It
+/// carries `{type: "updated", id, diff, unset}`, where `diff` is a `Partial<IUser>` with **no
+/// `_id` of its own** — the id lives in the sibling `id` member. The presence listener emits
+/// exactly that shape (`diff: {status, statusText?, statusSource?, statusExpiresAt?}`).
+/// Decoding such a `diff` as a [`User`] fails on the missing `_id`, and that is correct: only
+/// the `inserted` variant's `data` member is a whole user document. Merge a diff into a cached
+/// [`User`] field by field instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct User {
@@ -1750,6 +1836,11 @@ pub struct User {
 
 impl User {
     /// The name to show, honouring the server's `UI_Use_Real_Name` setting.
+    ///
+    /// Slightly more forgiving than the server's `getUserDisplayName`, which is
+    /// `useRealName ? name || username : username` — it has no fallback when
+    /// `UI_Use_Real_Name` is off, so it yields nothing for the app and visitor records that
+    /// carry a `name` but no `username`. This returns the `name` in that case.
     #[must_use]
     pub fn display_name(&self, use_real_name: bool) -> Option<&str> {
         let (first, second) =
@@ -1896,6 +1987,26 @@ mod tests {
         assert!(m.is_edited());
         assert!(m.is_deleted_tombstone());
         assert_eq!(m.t, Some(MessageType::Rm));
+    }
+
+    #[test]
+    fn a_thread_root_whose_replies_were_all_deleted_is_still_a_thread() {
+        // `Messages.decreaseReplyCountById` only `$inc`s tcount; it never unsets it, so the
+        // last reply going away leaves tcount: 0 next to a live tlm. The server's
+        // `isThreadMainMessage` tests presence, not the count.
+        let m = message(
+            r#"{"_id":"parent1","_updatedAt":{"$date":9},"rid":"r","msg":"q","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},"tcount":0,"tlm":{"$date":9}}"#,
+        );
+        assert_eq!(m.tcount, Some(0));
+        assert!(m.is_thread_main());
+
+        // tcount without tlm is not a thread root, matching the server predicate.
+        let partial = message(
+            r#"{"_id":"p2","_updatedAt":{"$date":9},"rid":"r","msg":"q","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},"tcount":4}"#,
+        );
+        assert!(!partial.is_thread_main());
     }
 
     #[test]
@@ -2167,9 +2278,25 @@ mod tests {
         let sys_mes = r.sys_mes.clone().unwrap();
         assert_eq!(sys_mes, SysMes::Enabled(false));
         assert_eq!(sys_mes.hidden_types(), None);
-        assert!(sys_mes.hides(&MessageType::Uj));
         // Round trip keeps the boolean form.
         assert_eq!(serde_json::to_value(&sys_mes).unwrap(), serde_json::json!(false));
+    }
+
+    #[test]
+    fn a_boolean_sys_mes_hides_nothing_at_the_room_level() {
+        // `getHiddenSystemMessages` is
+        //     Array.isArray(room.sysMes) ? room.sysMes : <workspace Hide_System_Messages>
+        // so neither boolean configures anything: `false` does not hide everything.
+        for wire in ["false", "true"] {
+            let r = room(&format!(
+                r#"{{"_id":"GENERAL","_updatedAt":{{"$date":1}},"t":"c","sysMes":{wire}}}"#
+            ));
+            let sys_mes = r.sys_mes.unwrap();
+            for t in [MessageType::Uj, MessageType::Ul, MessageType::Rm] {
+                assert!(!sys_mes.hides(&t), "sysMes:{wire} must not hide {t}");
+            }
+            assert_eq!(sys_mes.hidden_types(), None);
+        }
     }
 
     #[test]
@@ -2188,6 +2315,8 @@ mod tests {
 
         assert!(sys_mes.hides(&MessageType::Ul));
         assert!(!sys_mes.hides(&MessageType::Rm));
+        // An empty array is still the array arm, and hides nothing.
+        assert!(!SysMes::Hidden(Vec::new()).hides(&MessageType::Uj));
 
         assert_eq!(
             serde_json::to_value(&sys_mes).unwrap(),
@@ -2239,6 +2368,25 @@ mod tests {
     }
 
     #[test]
+    fn decodes_a_fractional_sla_due_time() {
+        // `dueTimeInMinutes` is a bare `number` in the REST schema and the admin form only
+        // checks `> 0`, so a fractional SLA is a valid policy and lands on the room.
+        let r = room(
+            r#"{"_id":"l1","_updatedAt":{"$date":1},"t":"l","slaId":"sla1",
+                "estimatedWaitingTimeQueue":1.5,"priorityWeight":99}"#,
+        );
+        assert_eq!(r.estimated_waiting_time_queue, Some(1.5));
+        assert_eq!(r.priority_weight, Some(99));
+
+        // The common whole-number case still decodes.
+        let default = room(
+            r#"{"_id":"l2","_updatedAt":{"$date":1},"t":"l",
+                "estimatedWaitingTimeQueue":9999999}"#,
+        );
+        assert_eq!(default.estimated_waiting_time_queue, Some(9_999_999.0));
+    }
+
+    #[test]
     fn decodes_a_direct_message_room_without_an_owner() {
         // IDirectMessageRoom omits `u` and `name` entirely.
         let r = room(
@@ -2283,7 +2431,7 @@ mod tests {
         );
 
         assert_eq!(s.id, "s1");
-        assert_eq!(s.display_name(), "general");
+        assert_eq!(s.display_name(), Some("general"));
         assert!(!s.has_unread());
         assert!(!s.is_favorite());
         assert_eq!(s.roles, None);
@@ -2313,7 +2461,7 @@ mod tests {
                 "threadDrafts":{"t1":"wip"},"customFields":{"a":1},"blocked":true}"#,
         );
 
-        assert_eq!(s.display_name(), "General");
+        assert_eq!(s.display_name(), Some("General"));
         assert!(s.has_unread());
         assert_eq!(s.total_mentions(), 3);
         assert!(s.is_favorite());
@@ -2335,6 +2483,32 @@ mod tests {
         assert!(json.contains("\"E2EKey\":\"enc\""), "{json}");
         assert!(json.contains("\"E2ESuggestedKey\":\"sugg\""), "{json}");
         assert_eq!(subscription(&json), s);
+    }
+
+    #[test]
+    fn decodes_a_subscription_whose_name_is_explicitly_null() {
+        // `createWithRoomAndUser` copies `name: room.name` unconditionally and the workspace
+        // runs Mongo with `ignoreUndefined: false`, so joining a nameless omnichannel room
+        // (`GET /v1/livechat/room.join`) persists `name: null`. `subscriptionFields` projects
+        // `name`, so the null reaches the stream.
+        let s = subscription(
+            r#"{"_id":"s1","_updatedAt":{"$date":1},"rid":"l1","t":"l",
+                "u":{"_id":"agent1","username":"agent"},"ts":{"$date":1},"name":null,
+                "open":true,"unread":1,"userMentions":1,"groupMentions":0}"#,
+        );
+
+        assert_eq!(s.name, None);
+        assert_eq!(s.display_name(), None);
+        // A missing key decodes the same way.
+        let absent = subscription(
+            r#"{"_id":"s1","_updatedAt":{"$date":1},"rid":"l1","t":"l",
+                "u":{"_id":"agent1"},"ts":{"$date":1},"open":true,"unread":0,
+                "userMentions":0,"groupMentions":0,"fname":"Jane Doe"}"#,
+        );
+        assert_eq!(absent.name, None);
+        assert_eq!(absent.display_name(), Some("Jane Doe"));
+        // And a null name is not re-emitted as null.
+        assert!(!serde_json::to_string(&s).unwrap().contains("\"name\""));
     }
 
     #[test]
