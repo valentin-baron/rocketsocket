@@ -221,6 +221,35 @@ behind an innocent-looking getter.
 
 ## 7. Decision — prefix and mention commands only, and that is the right model
 
+**First, a disambiguation, because "command" means two unrelated things here.**
+
+|  | Rocket.Chat **slash commands** (`/kick`) | **`#[command]`** in this framework (`!kick`) |
+|---|---|---|
+| What it is | a server feature | a client-side text convention |
+| Registered | `slashCommands.add(..)` in-process, or by an installed App | nowhere — nothing is registered with the server |
+| Requires the Apps Engine | **yes**, for anything external | **no** |
+| How the bot learns of it | it doesn't — it cannot | a normal message arrives on `stream-room-messages` |
+
+`#[command]` involves **no Apps integration, no slash-command registry, and no server-side
+registration of any kind.** It is a parser over the message stream the bot is already
+subscribed to. The entire mechanism:
+
+```
+stream-room-messages  →  IMessage { msg: "!add 1 2" }   ← the websocket, nothing else
+                      →  framework sees the "!" prefix
+                      →  parses "1" and "2" into i64
+                      →  calls your #[command] fn
+                      →  reply via REST chat.sendMessage
+```
+
+That is precisely what discord.py's `commands.Bot` was: it predates Discord slash commands
+by years and worked purely by reading message text. The proc macro is sugar over a `String`
+match on `MessageCreate` — you could write it by hand inside an `#[event]` handler, and
+that is the fallback if the macro layer is ever cut.
+
+Slash commands proper **are** Apps Engine territory, and are out of scope. Here is why that
+is not a limitation we chose but one the server imposes:
+
 Verified in the server source: `slashCommands.add({ command, callback, appId, .. })` is an
 **in-process registry** (`apps/meteor/app/utils/client/slashCommand.ts`), populated by
 server code or by installed Apps. There is no REST or DDP endpoint by which an external bot
@@ -230,6 +259,26 @@ blocks but can never *receive* a button click, because interactions route to
 firm:
 
 **For an external Rocket.Chat bot, text commands are the entire command surface.**
+
+**Corollary — do not default the prefix to `/`.** There is one path by which slash-looking
+text reaches a bot, and it is setting-dependent. `processSlashCommand.ts` handles an
+unrecognised command like this:
+
+```ts
+if (typeof command === 'string') {                                    // no such command
+    if (!settings.peek('Message_AllowUnrecognizedSlashCommand')) {
+        await warnUnrecognizedSlashCommand(chat, t('No_such_command', { command }));
+        return true;                                                  // swallowed
+    }
+    return false;                                                     // falls through as a normal message
+}
+```
+
+`Message_AllowUnrecognizedSlashCommand` **defaults to `false`**. So by default `/mybot foo`
+shows the sender "No such command" and the bot never sees it; flip the setting on and the
+same text arrives as an ordinary message the bot can parse. Support `/` as a configurable
+prefix, document the setting it depends on, and default to something like `!` that always
+works.
 
 Which is why discord.py is the right model to copy rather than modern discord.py or poise's
 slash-first design. The prefix-command machinery — prefix and mention triggers, argument
