@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/valentin-baron/rocketsocket"
+authors = ["Valentin Baron"]
+
+[workspace.dependencies]
+rocketsocket-model = { version = "0.0.0", path = "crates/rocketsocket-model" }
+
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["raw_value"] }
+compact_str = { version = "0.9", features = ["serde"] }
+thiserror = "2"
+time = { version = "0.3", features = ["serde", "parsing", "formatting", "macros"] }
+tokio = { version = "1", default-features = false }
+tokio-tungstenite = { version = "0.30", default-features = false }
+futures-util = { version = "0.3", default-features = false }
+tracing = "0.1"
+fastrand = "2"
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+todo = "warn"
+dbg_macro = "warn"

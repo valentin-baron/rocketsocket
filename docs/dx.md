@@ -219,7 +219,7 @@ Follow serenity's `_cached` naming discipline on the accessors: `msg.room()` may
 and returns `Result`; `msg.room_cached()` never does and returns `Option`. No hidden IO
 behind an innocent-looking getter.
 
-## 7. Decision — prefix and mention commands only, and that is the right model
+## 7. Decision — no command macro; text commands stay user-space
 
 **First, a disambiguation, because "command" means two unrelated things here.**
 
@@ -258,7 +258,35 @@ blocks but can never *receive* a button click, because interactions route to
 `POST /api/apps/ui.interaction/:appId` and 404 for an unregistered app — the conclusion is
 firm:
 
-**For an external Rocket.Chat bot, text commands are the entire command surface.**
+**For an external Rocket.Chat bot, text commands are the entire command surface — and
+that is exactly why we are *not* shipping a `#[command]` macro.**
+
+A command framework earns its complexity when the platform gives commands an in-app
+affordance: Discord renders slash-command names, descriptions, and typed argument
+autocomplete from what the bot registers. Rocket.Chat gives an external bot none of that —
+no registration, no autocomplete, no description surface, no interaction callback. A
+`#[command]` macro would therefore be pure sugar over `msg.text().split(' ')`, bought at the
+cost of a proc-macro dependency, a converter trait hierarchy, an autoref-specialization
+hack for `FromStr` arguments, and a `trybuild` suite to keep its error messages usable.
+
+So: **no `#[command]`, no `#[cog]`, no converters, no checks, no cooldowns.** Bots parse
+their own text inside an `#[event]` handler, which is a few lines and stays entirely under
+the author's control:
+
+```rust
+#[rocketsocket::event]
+async fn commands(ctx: Context<Data>, msg: MessageCreate) -> Result<()> {
+    let Some(rest) = msg.text().strip_prefix('!') else { return Ok(()) };
+    match rest.split_once(' ') {
+        Some(("echo", arg)) => msg.reply(arg).await?,
+        _ => return Ok(()),
+    };
+    Ok(())
+}
+```
+
+If a future Rocket.Chat release gives external bots a real command registration surface,
+this decision is worth revisiting — the design sketch is in this file's git history.
 
 **Corollary — do not default the prefix to `/`.** There is one path by which slash-looking
 text reaches a bot, and it is setting-dependent. `processSlashCommand.ts` handles an
@@ -285,40 +313,12 @@ slash-first design. The prefix-command machinery — prefix and mention triggers
 parsing with converters, `#[rest]` trailing capture, subcommands, aliases, cooldowns,
 checks, help generation — is not a legacy compatibility layer here. It is the product.
 
-Argument conversion mirrors discord.py's converter protocol:
-
-```rust
-pub trait FromArgs<'a, D>: Sized {
-    async fn from_args(ctx: &Context<D>, args: &mut ArgStream<'a>) -> Result<Self, ParseError>;
-}
-```
-
-Impls for the scalars via `FromStr`, for `Option<T>` (optional trailing), `Vec<T>`
-(greedy), `#[rest] String` (consume remainder), and — the ones that make it feel native —
-`User`, `Room`, `Message`, resolving `@username`, `#channel`, and message links against
-cache-then-REST. That resolution is async and fallible, which is exactly why `FromArgs`
-takes `&Context` rather than being a bare `FromStr`.
-
-## 8. Checks, cooldowns, errors
-
-discord.py stacks decorators. Rust proc-macro attributes don't stack cleanly, so these are
-arguments to the single `#[command]`:
-
-```rust
-#[rocketsocket::command(
-    aliases("rm", "clear"),
-    check = "is_moderator",
-    cooldown = "5s",
-    room_only,
-    on_error = "purge_error",
-)]
-```
+## 8. Errors
 
 Errors follow poise: one `#[non_exhaustive] FrameworkError` covering every phase (setup,
-event handler, argument parse, check failed, cooldown hit, command body, panic), each
-variant carrying borrowed context, resolved command-level → framework-level → built-in.
-`FrameworkError::CommandPanic` catches unwinds so one bad command can't take the bot down —
-discord.py's `on_command_error` behaviour, which people rely on more than they admit.
+event handler, extractor failure, handler body, panic), each variant carrying borrowed
+context, resolved handler-level -> framework-level -> built-in. `FrameworkError::Panic`
+catches unwinds so one bad handler cannot take the bot down.
 
 ## 9. Macro hygiene
 

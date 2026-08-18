@@ -81,7 +81,7 @@ rocketsocket-model      serde types, Id<Marker>, EJSON, zero IO, zero async
 rocketsocket-rest       reqwest client, one module per API section
 rocketsocket-realtime   DDP over WebSocket: subscriptions + liveness
 rocketsocket-cache      opt-in in-memory cache, ResourceType bitflags
-rocketsocket-macros     #[event], #[command], #[cog] proc macros
+rocketsocket-macros     #[event] proc macro
 rocketsocket            facade: Client, event dispatch, framework
 rocketsocket-codegen    dev-only: generates model + event enums from vendored RC sources
 ```
@@ -742,7 +742,7 @@ Plan explicitly for **9.0**, which will remove the ~116 deprecated methods, the 
 | **M4** | Event layer: `Stream`, generated `EventHandler`, `Standby` | echo bot in <30 lines; `MessageEvent` correctly classifies new/edit/delete/system |
 | **M5** | `rocketsocket-cache` | rooms/users/messages cached; `ResourceType` gating verified; no deadlock under concurrent update+read |
 | **M6a** | `#[event]` macro, extractors, registration, facade entity types | echo bot is one annotated fn; `msg.reply()` works; empty-registry startup check fires |
-| **M6b** | `#[command]` + `#[cog]`, converters, checks, cooldowns, unified errors | prefix commands with typed arguments incl. `User`/`Room` converters; `trybuild` suite covers every macro misuse |
+| **M6b** | ~~`#[command]` + `#[cog]`~~ — **cut**, see docs/dx.md §7 | text commands stay user-space: parse them in an `#[event]` handler |
 | **M7** | Docs, examples, 0.1 release | published to crates.io with the landmine list as a "Gotchas" doc page |
 
 Integration testing throughout against a **Dockerised Rocket.Chat** — pinned to 7.x and

@@ -1,0 +1,32 @@
+[package]
+name = "rocketsocket-realtime"
+description = "Rocket.Chat realtime API (DDP over WebSocket) client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["rustls-tls-native-roots"]
+rustls-tls-native-roots = ["tokio-tungstenite/rustls-tls-native-roots"]
+rustls-tls-webpki-roots = ["tokio-tungstenite/rustls-tls-webpki-roots"]
+native-tls = ["tokio-tungstenite/native-tls"]
+
+[dependencies]
+rocketsocket-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+fastrand.workspace = true
+futures-util = { workspace = true, features = ["sink", "std"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true
