@@ -125,8 +125,8 @@ impl<'de> Visitor<'de> for TimestampVisitor {
     }
 
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-        let v = i64::try_from(v)
-            .map_err(|_| E::custom(format!("epoch millis {v} is out of range")))?;
+        let v =
+            i64::try_from(v).map_err(|_| E::custom(format!("epoch millis {v} is out of range")))?;
         self.visit_i64(v)
     }
 
