@@ -401,6 +401,30 @@ so regeneration never clobbers them.
 
 ---
 
+### 5.6 Known model limitations (open)
+
+Surfaced by the adversarial review of `entity.rs`; neither is fixed, both are recorded so
+the cache and facade layers do not assume otherwise.
+
+1. **Whole-document round trip is lossy.** Only the *enum* round trip is lossless. `Message`
+   does not model `content` (the E2EE ciphertext), `translations`, `e2eMentions`,
+   `location`, `federation`, `slaData`/`priorityData`, `actionLinks`, `fileUpload`, or the
+   omnichannel system-message payloads; `Room` drops the omnichannel closure/email/metrics
+   envelope. Decode → encode therefore silently discards them, and `content` in particular
+   means **a forwarded message from an E2EE room loses its ciphertext**. Fix is a
+   `#[serde(flatten)] extra: Map<String, Value>` on `Message` and `Room`; until then,
+   nothing may persist or forward a decoded document and assume fidelity.
+
+2. **Explicit `null` inside a collection is still fatal.** Mongo runs with
+   `ignoreUndefined: false`, so `undefined` is persisted as `null` — which is how
+   `Subscription::name` came to be nullable. The same mechanism could put a `null` *element*
+   inside `Room::muted`/`unmuted`/`usernames`/`uids`, `Subscription::roles`/`ignored`,
+   `User::roles`, `Message::replies`, or `Reaction::usernames`, and a `Vec<String>` rejects
+   that. Unproven for any specific field — `setReaction.ts:77` pushes a `string`-typed
+   `user.username` that is `undefined` at the type level, but it was not shown reachable.
+   If it ever appears, the fix is a null-skipping `deserialize_with` on those fields.
+   `Subscription::ts` is the next most likely instance of the same pattern.
+
 ## 6. Event layer
 
 ### 6.1 Wire shape

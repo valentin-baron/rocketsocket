@@ -1618,11 +1618,19 @@ impl Subscription {
     ///
     /// Note that this is *not* what the server renders for a direct message: `direct.ts`'s
     /// `roomName` returns `fname` only when `UI_Use_Real_Name` is on and falls back to `name`
-    /// otherwise, so on a workspace configured to show usernames this method prefers the wrong
-    /// one. It has no access to that setting; a caller that cares must pick the field itself.
+    /// `use_real_name` is the workspace's `UI_Use_Real_Name` setting, which a client reads
+    /// from `public-settings/get`. It matters because the server's own rule for direct
+    /// messages (`roomTypes/direct.ts:79-83`) returns `fname` only when that setting is on
+    /// and `name` otherwise — so ignoring it shows real names on a workspace deliberately
+    /// configured to show usernames.
+    ///
+    /// Either field may be absent from a projected stub, so this falls back to whichever is
+    /// present rather than returning nothing.
     #[must_use]
-    pub fn display_name(&self) -> Option<&str> {
-        self.fname.as_deref().or(self.name.as_deref())
+    pub fn display_name(&self, use_real_name: bool) -> Option<&str> {
+        let (first, second) =
+            if use_real_name { (&self.fname, &self.name) } else { (&self.name, &self.fname) };
+        first.as_deref().or(second.as_deref())
     }
 }
 
@@ -2431,7 +2439,7 @@ mod tests {
         );
 
         assert_eq!(s.id, "s1");
-        assert_eq!(s.display_name(), Some("general"));
+        assert_eq!(s.display_name(false), Some("general"));
         assert!(!s.has_unread());
         assert!(!s.is_favorite());
         assert_eq!(s.roles, None);
@@ -2461,7 +2469,10 @@ mod tests {
                 "threadDrafts":{"t1":"wip"},"customFields":{"a":1},"blocked":true}"#,
         );
 
-        assert_eq!(s.display_name(), Some("General"));
+        // Both `name` and `fname` are present, which is exactly the case UI_Use_Real_Name
+        // decides: the server shows `fname` only when the setting is on.
+        assert_eq!(s.display_name(false), Some("general"));
+        assert_eq!(s.display_name(true), Some("General"));
         assert!(s.has_unread());
         assert_eq!(s.total_mentions(), 3);
         assert!(s.is_favorite());
@@ -2498,7 +2509,7 @@ mod tests {
         );
 
         assert_eq!(s.name, None);
-        assert_eq!(s.display_name(), None);
+        assert_eq!(s.display_name(false), None);
         // A missing key decodes the same way.
         let absent = subscription(
             r#"{"_id":"s1","_updatedAt":{"$date":1},"rid":"l1","t":"l",
@@ -2506,7 +2517,7 @@ mod tests {
                 "userMentions":0,"groupMentions":0,"fname":"Jane Doe"}"#,
         );
         assert_eq!(absent.name, None);
-        assert_eq!(absent.display_name(), Some("Jane Doe"));
+        assert_eq!(absent.display_name(false), Some("Jane Doe"));
         // And a null name is not re-emitted as null.
         assert!(!serde_json::to_string(&s).unwrap().contains("\"name\""));
     }
