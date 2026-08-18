@@ -540,11 +540,8 @@ impl UserRef {
     /// may carry only one.
     #[must_use]
     pub fn display_name(&self, use_real_name: bool) -> Option<&str> {
-        let (first, second) = if use_real_name {
-            (&self.name, &self.username)
-        } else {
-            (&self.username, &self.name)
-        };
+        let (first, second) =
+            if use_real_name { (&self.name, &self.username) } else { (&self.username, &self.name) };
         first.as_deref().or(second.as_deref())
     }
 }
@@ -730,11 +727,7 @@ pub struct Message {
     ///
     /// Also set on deletion when the server is configured to keep tombstones — see
     /// [`Message::is_deleted_tombstone`].
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub edited_at: Option<Timestamp>,
     /// Who performed the edit. Not necessarily the author.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -794,11 +787,7 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcount: Option<i64>,
     /// Timestamp of the last reply. Present on the thread's parent message.
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub tlm: Option<Timestamp>,
     /// Users following the thread, on the parent message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -813,11 +802,7 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dcount: Option<i64>,
     /// Timestamp of the last message in the linked discussion.
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub dlm: Option<Timestamp>,
 
     /// Whether this message may be visually grouped with the previous one.
@@ -835,11 +820,7 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned: Option<bool>,
     /// When the message was pinned.
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub pinned_at: Option<Timestamp>,
     /// Who pinned the message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -951,9 +932,7 @@ impl Message {
     /// `starred` per recipient.
     #[must_use]
     pub fn is_starred_by(&self, user: &UserId) -> bool {
-        self.starred
-            .as_ref()
-            .is_some_and(|stars| stars.iter().any(|star| star.user_id == *user))
+        self.starred.as_ref().is_some_and(|stars| stars.iter().any(|star| star.user_id == *user))
     }
 
     /// Whether the message is pinned, treating an absent field as "not pinned".
@@ -1111,11 +1090,7 @@ pub struct Room {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub e2e_key_id: Option<String>,
     /// Users still waiting to be handed the room's E2E key.
-    #[serde(
-        rename = "usersWaitingForE2EKeys",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "usersWaitingForE2EKeys", default, skip_serializing_if = "Option::is_none")]
     pub users_waiting_for_e2e_keys: Option<Vec<Value>>,
     /// Read-only room.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1145,25 +1120,13 @@ pub struct Room {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_message: Option<Box<Message>>,
     /// Timestamp of the last message.
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub lm: Option<Timestamp>,
     /// When the room was created.
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub ts: Option<Timestamp>,
     /// When a WebRTC call started in this room.
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub web_rtc_call_start_time: Option<Timestamp>,
 
     /// Parent room id, set on discussions.
@@ -1248,11 +1211,7 @@ pub struct Room {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_response: Option<Value>,
     /// When the conversation entered the queue.
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub queued_at: Option<Timestamp>,
     /// Conversation tags.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1342,11 +1301,7 @@ pub struct OldRoomKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub e2e_key_id: Option<String>,
     /// When the key was rotated out.
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub ts: Option<Timestamp>,
     /// The key itself, encrypted with the user's key pair. Note the wire name: `E2EKey`.
     #[serde(rename = "E2EKey", default, skip_serializing_if = "Option::is_none")]
@@ -1395,18 +1350,10 @@ pub struct Subscription {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alert: Option<bool>,
     /// Last time this user read the room ("last seen").
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub ls: Option<Timestamp>,
     /// Last time a message was received in the room ("last received").
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub lr: Option<Timestamp>,
     /// Whether the room is favourited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1461,11 +1408,7 @@ pub struct Subscription {
     pub e2e_key: Option<String>,
     /// A key another member offered while this user's key was still pending.
     /// Wire name: `E2ESuggestedKey`.
-    #[serde(
-        rename = "E2ESuggestedKey",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "E2ESuggestedKey", default, skip_serializing_if = "Option::is_none")]
     pub e2e_suggested_key: Option<String>,
     /// Superseded room keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1553,11 +1496,7 @@ pub struct Subscription {
     pub code: Option<Value>,
 
     /// When ABAC access was last re-evaluated for this membership.
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub abac_last_time_checked: Option<Timestamp>,
     /// Free-form custom fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1600,9 +1539,7 @@ impl Subscription {
     /// Whether this user holds `role` in the subscribed room.
     #[must_use]
     pub fn has_role(&self, role: &str) -> bool {
-        self.roles
-            .as_ref()
-            .is_some_and(|roles| roles.iter().any(|r| r == role))
+        self.roles.as_ref().is_some_and(|roles| roles.iter().any(|r| r == role))
     }
 
     /// The name to show, preferring the display name.
@@ -1671,11 +1608,7 @@ pub struct User {
     )]
     pub updated_at: Option<Timestamp>,
     /// When the account was created.
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub created_at: Option<Timestamp>,
 
     /// Login name. Absent for some app and visitor records.
@@ -1722,21 +1655,13 @@ pub struct User {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_source: Option<PresenceSource>,
     /// When a temporary status reverts to [`User::status_default`].
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub status_expires_at: Option<Timestamp>,
     /// Id of the custom status in use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_id: Option<String>,
     /// When the user last logged in.
-    #[serde(
-        default,
-        with = "crate::datetime::option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, with = "crate::datetime::option", skip_serializing_if = "Option::is_none")]
     pub last_login: Option<Timestamp>,
 
     /// Registered email addresses.
@@ -1827,11 +1752,8 @@ impl User {
     /// The name to show, honouring the server's `UI_Use_Real_Name` setting.
     #[must_use]
     pub fn display_name(&self, use_real_name: bool) -> Option<&str> {
-        let (first, second) = if use_real_name {
-            (&self.name, &self.username)
-        } else {
-            (&self.username, &self.name)
-        };
+        let (first, second) =
+            if use_real_name { (&self.name, &self.username) } else { (&self.username, &self.name) };
         first.as_deref().or(second.as_deref())
     }
 
@@ -1841,17 +1763,709 @@ impl User {
     /// holding the role — check `roles.is_some()` first if the distinction matters.
     #[must_use]
     pub fn has_role(&self, role: &str) -> bool {
-        self.roles
-            .as_ref()
-            .is_some_and(|roles| roles.iter().any(|r| r == role))
+        self.roles.as_ref().is_some_and(|roles| roles.iter().any(|r| r == role))
     }
 
     /// Whether the user is reachable right now: online, away or busy.
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        matches!(
-            self.status,
-            Some(UserStatus::Online | UserStatus::Away | UserStatus::Busy)
-        )
+        matches!(self.status, Some(UserStatus::Online | UserStatus::Away | UserStatus::Busy))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A message exactly as it arrives in a `stream-room-messages` frame.
+    const CAPTURED_MESSAGE: &str = r#"{"_id":"7aDSXtjMA3KPLxLjt","rid":"GENERAL","msg":"hello @john.doe",
+ "ts":{"$date":1755529012345},
+ "u":{"_id":"aobEdbYhXfu5hkeqG","username":"alice","name":"Alice A."},
+ "_updatedAt":{"$date":1755529012390},"urls":[],
+ "mentions":[{"_id":"rbAXPnMktTFbNpwtJ","username":"john.doe","name":"John Doe","type":"user"}],
+ "channels":[]}"#;
+
+    fn message(json: &str) -> Message {
+        serde_json::from_str(json)
+            .unwrap_or_else(|e| panic!("failed to decode message: {e}\n{json}"))
+    }
+
+    fn room(json: &str) -> Room {
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("failed to decode room: {e}\n{json}"))
+    }
+
+    fn subscription(json: &str) -> Subscription {
+        serde_json::from_str(json)
+            .unwrap_or_else(|e| panic!("failed to decode subscription: {e}\n{json}"))
+    }
+
+    fn user(json: &str) -> User {
+        serde_json::from_str(json).unwrap_or_else(|e| panic!("failed to decode user: {e}\n{json}"))
+    }
+
+    // -- Message -------------------------------------------------------------------------
+
+    #[test]
+    fn decodes_a_captured_stream_message() {
+        let m = message(CAPTURED_MESSAGE);
+
+        assert_eq!(m.id, "7aDSXtjMA3KPLxLjt");
+        assert_eq!(m.rid, "GENERAL");
+        assert_eq!(m.msg, "hello @john.doe");
+        assert_eq!(m.ts.unix_millis(), 1_755_529_012_345);
+        assert_eq!(m.updated_at.unix_millis(), 1_755_529_012_390);
+        assert_eq!(m.u.id, "aobEdbYhXfu5hkeqG");
+        assert_eq!(m.u.username.as_deref(), Some("alice"));
+        assert_eq!(m.u.name.as_deref(), Some("Alice A."));
+        assert_eq!(m.urls.as_deref(), Some(&[][..]));
+        assert_eq!(m.channels.as_deref(), Some(&[][..]));
+
+        let mentions = m.mentions.as_ref().unwrap();
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].id, "rbAXPnMktTFbNpwtJ");
+        assert_eq!(mentions[0].mention_type, Some(MentionType::User));
+        assert_eq!(mentions[0].username.as_deref(), Some("john.doe"));
+
+        assert!(!m.is_system());
+        assert!(!m.is_edited());
+        assert!(!m.is_thread_reply());
+    }
+
+    #[test]
+    fn decodes_a_message_carrying_only_the_mandatory_fields() {
+        // The narrowest projection any stream applies.
+        let m = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":1},"rid":"GENERAL","msg":"",
+                "ts":{"$date":1},"u":{"_id":"u1","username":"bob"}}"#,
+        );
+
+        assert_eq!(m.msg, "");
+        assert_eq!(m.u.name, None);
+        assert_eq!(m.t, None);
+        assert_eq!(m.mentions, None);
+        assert_eq!(m.attachments, None);
+        assert_eq!(m.reactions, None);
+        assert_eq!(m.starred, None);
+    }
+
+    #[test]
+    fn accepts_an_explicitly_null_author_name() {
+        // The server unsets `name` rather than deleting the key.
+        let m = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":1},"rid":"r","msg":"hi","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob","name":null}}"#,
+        );
+        assert_eq!(m.u.name, None);
+    }
+
+    #[test]
+    fn accepts_an_author_stub_without_a_username() {
+        // `IMessage.u` types `username` as required, but imports and app-authored messages
+        // have produced stubs without it, and a `changed` frame can deliver a partial `u`.
+        let m = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":1},"rid":"r","msg":"hi","ts":{"$date":1},
+                "u":{"_id":"rocket.cat"}}"#,
+        );
+        assert_eq!(m.u.username, None);
+    }
+
+    #[test]
+    fn decodes_an_edited_message() {
+        let m = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":20},"rid":"r","msg":"fixed","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},
+                "editedAt":{"$date":20},"editedBy":{"_id":"u1","username":"bob"}}"#,
+        );
+
+        assert!(m.is_edited());
+        assert_eq!(m.edited_at.unwrap().unix_millis(), 20);
+        assert_eq!(m.edited_by.as_ref().unwrap().id, "u1");
+        assert!(!m.is_deleted_tombstone());
+    }
+
+    #[test]
+    fn recognises_a_deletion_tombstone() {
+        // With Message_KeepHistory on, a delete rewrites the message in place.
+        let m = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":30},"rid":"r","msg":"","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},"t":"rm",
+                "editedAt":{"$date":30},"editedBy":{"_id":"u1","username":"bob"}}"#,
+        );
+
+        assert!(m.is_system());
+        assert!(m.is_edited());
+        assert!(m.is_deleted_tombstone());
+        assert_eq!(m.t, Some(MessageType::Rm));
+    }
+
+    #[test]
+    fn an_unedited_rm_message_is_not_a_tombstone() {
+        let m = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":1},"rid":"r","msg":"","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},"t":"rm"}"#,
+        );
+        assert!(!m.is_deleted_tombstone());
+    }
+
+    #[test]
+    fn an_unknown_system_message_type_decodes_and_round_trips() {
+        // `jitsi_call_started` was dropped from MessageTypes years ago but still sits in
+        // production databases, and every release adds new types.
+        let m = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":1},"rid":"r","msg":"","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},"t":"jitsi_call_started"}"#,
+        );
+
+        assert!(m.is_system());
+        let t = m.t.clone().unwrap();
+        assert!(t.is_unknown());
+        assert_eq!(t.as_str(), "jitsi_call_started");
+        assert_eq!(serde_json::to_value(&t).unwrap(), "jitsi_call_started");
+    }
+
+    #[test]
+    fn unknown_message_type_round_trips_byte_identically() {
+        for wire in ["totally_new_type", "uj2", "", "user-did-a-thing"] {
+            let json = serde_json::to_string(wire).unwrap();
+            let decoded: MessageType = serde_json::from_str(&json).unwrap();
+            assert!(decoded.is_unknown(), "{wire} should be unknown");
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn every_known_message_type_round_trips() {
+        // Guards against a typo in one of the ~60 wire literals: a mistyped literal would
+        // decode to Unknown rather than to its variant.
+        for wire in [
+            "e2e",
+            "uj",
+            "ui",
+            "uir",
+            "ul",
+            "ru",
+            "au",
+            "mute_unmute",
+            "r",
+            "ut",
+            "wm",
+            "rm",
+            "subscription-role-added",
+            "subscription-role-removed",
+            "room-archived",
+            "room-unarchived",
+            "room_changed_privacy",
+            "room_changed_description",
+            "room_changed_announcement",
+            "room_changed_avatar",
+            "room_changed_topic",
+            "room_e2e_enabled",
+            "room_e2e_disabled",
+            "user-muted",
+            "user-unmuted",
+            "user-banned",
+            "user-unbanned",
+            "room-removed-read-only",
+            "room-set-read-only",
+            "room-allowed-reacting",
+            "room-disallowed-reacting",
+            "command",
+            "videoconf",
+            "message_pinned",
+            "message_pinned_e2e",
+            "new-moderator",
+            "moderator-removed",
+            "new-owner",
+            "owner-removed",
+            "new-leader",
+            "leader-removed",
+            "discussion-created",
+            "abac-removed-user-from-room",
+            "removed-user-from-team",
+            "added-user-to-team",
+            "ult",
+            "user-converted-to-team",
+            "user-converted-to-channel",
+            "user-removed-room-from-team",
+            "user-deleted-room-from-team",
+            "user-added-room-to-team",
+            "ujt",
+            "livechat_navigation_history",
+            "livechat_transfer_history",
+            "livechat_transcript_history",
+            "livechat_video_call",
+            "livechat_transfer_history_fallback",
+            "livechat-close",
+            "livechat-started",
+            "omnichannel_priority_change_history",
+            "omnichannel_sla_change_history",
+            "omnichannel_placed_chat_on_hold",
+            "omnichannel_on_hold_chat_resumed",
+        ] {
+            let t = MessageType::from(wire);
+            assert!(!t.is_unknown(), "{wire} decoded as Unknown");
+            assert_eq!(t.as_str(), wire);
+            assert_eq!(String::from(t), wire);
+        }
+    }
+
+    #[test]
+    fn starred_is_a_list_of_users_not_a_boolean() {
+        let m = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":1},"rid":"r","msg":"hi","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},
+                "starred":[{"_id":"aobEdbYhXfu5hkeqG"}],"pinned":true}"#,
+        );
+
+        assert_eq!(
+            m.starred.as_deref(),
+            Some(&[Star { user_id: UserId::new("aobEdbYhXfu5hkeqG") }][..])
+        );
+        assert!(m.is_starred_by(&UserId::new("aobEdbYhXfu5hkeqG")));
+        assert!(!m.is_starred_by(&UserId::new("someone.else")));
+        // `pinned`, unlike `starred`, really is a boolean.
+        assert!(m.is_pinned());
+    }
+
+    #[test]
+    fn an_empty_starred_array_means_nobody_starred_it() {
+        let m = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":1},"rid":"r","msg":"hi","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},"starred":[]}"#,
+        );
+        assert_eq!(m.starred.as_deref(), Some(&[][..]));
+        assert!(!m.is_starred_by(&UserId::new("u1")));
+    }
+
+    #[test]
+    fn decodes_reactions_keyed_by_emoji_with_colons() {
+        let m = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":1},"rid":"r","msg":"hi","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},
+                "reactions":{":thumbsup:":{"usernames":["alice","bob"]},
+                             ":tada:":{"usernames":["carol"],"names":["Carol C."]}}}"#,
+        );
+
+        let thumbs = m.reaction(":thumbsup:").unwrap();
+        assert_eq!(thumbs.count(), 2);
+        assert!(thumbs.contains("alice"));
+        assert_eq!(thumbs.names, None);
+
+        let tada = m.reaction(":tada:").unwrap();
+        assert_eq!(tada.names.as_deref(), Some(&["Carol C.".to_owned()][..]));
+
+        // The key really does include the colons.
+        assert!(m.reaction("thumbsup").is_none());
+    }
+
+    #[test]
+    fn decodes_thread_and_discussion_fields() {
+        let reply = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":1},"rid":"r","msg":"re","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},"tmid":"parent1","tshow":true}"#,
+        );
+        assert!(reply.is_thread_reply());
+        assert_eq!(reply.tshow, Some(true));
+        assert!(!reply.is_thread_main());
+
+        let parent = message(
+            r#"{"_id":"parent1","_updatedAt":{"$date":1},"rid":"r","msg":"q","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},"tcount":3,"tlm":{"$date":99},
+                "replies":["u1","u2"]}"#,
+        );
+        assert!(parent.is_thread_main());
+        assert!(!parent.is_thread_reply());
+        assert_eq!(parent.tlm.unwrap().unix_millis(), 99);
+        assert_eq!(parent.replies.as_ref().unwrap().len(), 2);
+
+        let discussion = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":1},"rid":"r","msg":"topic","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},"t":"discussion-created",
+                "drid":"disc1","dcount":2,"dlm":{"$date":5}}"#,
+        );
+        assert!(discussion.is_discussion_parent());
+        assert_eq!(discussion.drid.as_ref().unwrap(), "disc1");
+        assert_eq!(discussion.dcount, Some(2));
+        assert_eq!(discussion.dlm.unwrap().unix_millis(), 5);
+    }
+
+    #[test]
+    fn decodes_files_urls_and_opaque_blobs() {
+        let m = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":1},"rid":"r","msg":"","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},
+                "file":{"_id":"f1","name":"a.png","type":"image/png","format":"png","size":12},
+                "files":[{"_id":"f1","name":"a.png","type":"image/png","typeGroup":"image"}],
+                "attachments":[{"title":"a.png","image_url":"/file-upload/f1/a.png"}],
+                "urls":[{"url":"https://example.com","meta":{"title":"Example","pageCount":3},
+                         "headers":{"contentType":"text/html"}}],
+                "md":[{"type":"PARAGRAPH","value":[]}],
+                "blocks":[{"type":"section"}],
+                "customFields":{"ticket":42},
+                "bot":{"i":"js.SDK"},
+                "_hidden":false,"imported":true,"e2e":"done"}"#,
+        );
+
+        assert_eq!(m.file.as_ref().unwrap().id, "f1");
+        assert_eq!(m.file.as_ref().unwrap().content_type.as_deref(), Some("image/png"));
+        assert_eq!(m.files.as_ref().unwrap()[0].type_group.as_deref(), Some("image"));
+        assert_eq!(m.attachments.as_ref().unwrap().len(), 1);
+
+        let url = &m.urls.as_ref().unwrap()[0];
+        assert_eq!(url.url, "https://example.com");
+        // `meta` is typed Record<string, string> but real payloads carry non-strings.
+        assert_eq!(url.meta["pageCount"], serde_json::json!(3));
+        assert_eq!(url.headers.as_ref().unwrap().content_type.as_deref(), Some("text/html"));
+
+        assert!(m.md.is_some());
+        assert!(m.blocks.is_some());
+        assert_eq!(m.hidden, Some(false));
+        assert_eq!(m.imported, Some(true));
+        assert_eq!(m.e2e, Some(E2eStatus::Done));
+        assert!(m.bot.is_some());
+    }
+
+    #[test]
+    fn ignores_fields_this_crate_does_not_model() {
+        // `services` on a user, `translations` on a message, anything a future release adds.
+        let m = message(
+            r#"{"_id":"abc","_updatedAt":{"$date":1},"rid":"r","msg":"hi","ts":{"$date":1},
+                "u":{"_id":"u1","username":"bob"},
+                "translations":{"de":"hallo"},"someFieldFromRocketChat9":{"nested":[1,2]}}"#,
+        );
+        assert_eq!(m.msg, "hi");
+    }
+
+    #[test]
+    fn message_round_trips_through_json() {
+        let m = message(CAPTURED_MESSAGE);
+        let encoded = serde_json::to_string(&m).unwrap();
+        assert_eq!(message(&encoded), m);
+        // Absent optionals must not come back as nulls.
+        assert!(!encoded.contains("null"), "{encoded}");
+        assert!(!encoded.contains("\"t\":"), "{encoded}");
+    }
+
+    // -- Room ----------------------------------------------------------------------------
+
+    #[test]
+    fn decodes_a_room_with_only_the_mandatory_fields() {
+        let r = room(r#"{"_id":"GENERAL","_updatedAt":{"$date":1},"t":"c"}"#);
+
+        assert_eq!(r.t, RoomType::Channel);
+        assert!(r.t.is_public());
+        // Declared non-optional by core-typings, projected away in practice.
+        assert_eq!(r.msgs, None);
+        assert_eq!(r.users_count, None);
+        assert_eq!(r.u, None);
+    }
+
+    #[test]
+    fn decodes_sys_mes_as_a_boolean() {
+        let r = room(r#"{"_id":"GENERAL","_updatedAt":{"$date":1},"t":"c","sysMes":false}"#);
+
+        let sys_mes = r.sys_mes.clone().unwrap();
+        assert_eq!(sys_mes, SysMes::Enabled(false));
+        assert_eq!(sys_mes.hidden_types(), None);
+        assert!(sys_mes.hides(&MessageType::Uj));
+        // Round trip keeps the boolean form.
+        assert_eq!(serde_json::to_value(&sys_mes).unwrap(), serde_json::json!(false));
+    }
+
+    #[test]
+    fn decodes_sys_mes_as_an_array_of_hidden_types() {
+        let r = room(
+            r#"{"_id":"GENERAL","_updatedAt":{"$date":1},"t":"c",
+                "sysMes":["uj","ul","room_changed_topic","brand_new_type"]}"#,
+        );
+
+        let sys_mes = r.sys_mes.clone().unwrap();
+        let hidden = sys_mes.hidden_types().unwrap();
+        assert_eq!(hidden.len(), 4);
+        assert_eq!(hidden[0], MessageType::Uj);
+        assert_eq!(hidden[2], MessageType::RoomChangedTopic);
+        assert!(hidden[3].is_unknown());
+
+        assert!(sys_mes.hides(&MessageType::Ul));
+        assert!(!sys_mes.hides(&MessageType::Rm));
+
+        assert_eq!(
+            serde_json::to_value(&sys_mes).unwrap(),
+            serde_json::json!(["uj", "ul", "room_changed_topic", "brand_new_type"])
+        );
+    }
+
+    #[test]
+    fn decodes_role_priorities_created_in_both_shapes() {
+        let counted =
+            room(r#"{"_id":"r","_updatedAt":{"$date":1},"t":"p","rolePrioritiesCreated":3}"#);
+        assert_eq!(counted.role_priorities_created, Some(RolePrioritiesCreated::Version(3)));
+
+        let flagged =
+            room(r#"{"_id":"r","_updatedAt":{"$date":1},"t":"p","rolePrioritiesCreated":true}"#);
+        assert_eq!(flagged.role_priorities_created, Some(RolePrioritiesCreated::Flag(true)));
+
+        for r in [&counted, &flagged] {
+            let json = serde_json::to_string(r).unwrap();
+            assert_eq!(room(&json), *r);
+        }
+    }
+
+    #[test]
+    fn decodes_a_realistic_channel_payload() {
+        // Field set asserted by the server's own `channels.info` end-to-end test.
+        let r = room(
+            r#"{"_id":"GENERAL","name":"general","fname":"general","t":"c","msgs":42,
+                "usersCount":7,"u":{"_id":"rocket.cat","username":"rocket.cat"},
+                "ts":{"$date":1755529012000},"ro":false,"sysMes":true,"default":true,
+                "_updatedAt":{"$date":1755529012390},"avatarETag":"abc123",
+                "announcementDetails":null,"lastMessage":{"_id":"m1","_updatedAt":{"$date":2},
+                "rid":"GENERAL","msg":"hi","ts":{"$date":2},"u":{"_id":"u1","username":"bob"}}}"#,
+        );
+
+        assert_eq!(r.msgs, Some(42));
+        assert_eq!(r.users_count, Some(7));
+        assert_eq!(r.display_name(), Some("general"));
+        assert_eq!(r.default, Some(true));
+        assert_eq!(r.avatar_etag.as_deref(), Some("abc123"));
+        assert_eq!(r.announcement_details, None);
+        assert_eq!(r.last_message.as_ref().unwrap().msg, "hi");
+        assert!(!r.is_direct());
+        assert!(!r.is_team());
+
+        // `avatarETag` is not what camelCase would produce from `avatar_etag`.
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"avatarETag\":\"abc123\""), "{json}");
+    }
+
+    #[test]
+    fn decodes_a_direct_message_room_without_an_owner() {
+        // IDirectMessageRoom omits `u` and `name` entirely.
+        let r = room(
+            r#"{"_id":"d1","_updatedAt":{"$date":1},"t":"d",
+                "uids":["u1","u2","u3"],"usernames":["a","b","c"]}"#,
+        );
+
+        assert!(r.is_direct());
+        assert!(r.is_multi_user_direct());
+        assert_eq!(r.u, None);
+        assert_eq!(r.name, None);
+    }
+
+    #[test]
+    fn an_unknown_room_type_decodes_and_round_trips() {
+        let r = room(r#"{"_id":"r","_updatedAt":{"$date":1},"t":"x"}"#);
+
+        assert!(r.t.is_unknown());
+        assert_eq!(r.t.as_str(), "x");
+        assert!(!r.t.is_public() && !r.t.is_direct() && !r.t.is_private() && !r.t.is_group());
+        assert_eq!(serde_json::to_value(&r.t).unwrap(), "x");
+    }
+
+    #[test]
+    fn room_type_helpers_agree_with_the_wire_values() {
+        assert!(RoomType::from("c").is_public());
+        assert!(RoomType::from("p").is_private());
+        assert!(RoomType::from("d").is_direct());
+        assert!(RoomType::from("l").is_omnichannel());
+        assert!(RoomType::from("c").is_group() && RoomType::from("p").is_group());
+        assert!(!RoomType::from("d").is_group());
+    }
+
+    // -- Subscription --------------------------------------------------------------------
+
+    #[test]
+    fn decodes_a_subscription_missing_every_optional_field() {
+        let s = subscription(
+            r#"{"_id":"s1","_updatedAt":{"$date":1},"rid":"GENERAL","t":"c",
+                "u":{"_id":"u1","username":"bob"},"ts":{"$date":1},"name":"general",
+                "open":true,"unread":0,"userMentions":0,"groupMentions":0}"#,
+        );
+
+        assert_eq!(s.id, "s1");
+        assert_eq!(s.display_name(), "general");
+        assert!(!s.has_unread());
+        assert!(!s.is_favorite());
+        assert_eq!(s.roles, None);
+        assert_eq!(s.ls, None);
+        assert_eq!(s.e2e_key, None);
+        // `true`-only literals: absent means false.
+        assert_eq!(s.hide_unread_status, None);
+        assert!(!s.hides_unread_status());
+        assert!(!s.hides_mention_status());
+    }
+
+    #[test]
+    fn decodes_a_fully_populated_subscription() {
+        let s = subscription(
+            r#"{"_id":"s1","_updatedAt":{"$date":9},"rid":"GENERAL","t":"c",
+                "u":{"_id":"u1","username":"bob","name":"Bob B."},"ts":{"$date":1},
+                "name":"general","fname":"General","open":true,"alert":true,"f":true,
+                "unread":3,"userMentions":1,"groupMentions":2,
+                "ls":{"$date":5},"lr":{"$date":6},"roles":["owner","moderator"],
+                "hideUnreadStatus":true,"hideMentionStatus":true,
+                "E2EKey":"enc","E2ESuggestedKey":"sugg",
+                "oldRoomKeys":[{"e2eKeyId":"k1","ts":{"$date":4},"E2EKey":"old"}],
+                "unreadAlert":"mentions","desktopNotifications":"all",
+                "mobilePushNotifications":"nothing","emailNotifications":"mentions",
+                "desktopPrefOrigin":"subscription","tunread":["t1"],
+                "status":"INVITED","inviter":{"_id":"u2","username":"carol"},
+                "threadDrafts":{"t1":"wip"},"customFields":{"a":1},"blocked":true}"#,
+        );
+
+        assert_eq!(s.display_name(), "General");
+        assert!(s.has_unread());
+        assert_eq!(s.total_mentions(), 3);
+        assert!(s.is_favorite());
+        assert!(s.has_role("owner"));
+        assert!(!s.has_role("leader"));
+        assert!(s.hides_unread_status() && s.hides_mention_status());
+        assert_eq!(s.e2e_key.as_deref(), Some("enc"));
+        assert_eq!(s.e2e_suggested_key.as_deref(), Some("sugg"));
+        assert_eq!(s.old_room_keys.as_ref().unwrap()[0].e2e_key.as_deref(), Some("old"));
+        assert_eq!(s.unread_alert, Some(UnreadAlert::Mentions));
+        assert_eq!(s.desktop_notifications, Some(NotificationPreference::All));
+        assert_eq!(s.desktop_pref_origin, Some(PreferenceOrigin::Subscription));
+        assert_eq!(s.status, Some(SubscriptionStatus::Invited));
+        assert_eq!(s.inviter.as_ref().unwrap().id, "u2");
+        assert_eq!(s.thread_drafts.as_ref().unwrap()["t1"], "wip");
+
+        // The oddly-capitalised keys must survive a round trip.
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"E2EKey\":\"enc\""), "{json}");
+        assert!(json.contains("\"E2ESuggestedKey\":\"sugg\""), "{json}");
+        assert_eq!(subscription(&json), s);
+    }
+
+    #[test]
+    fn an_unknown_notification_preference_does_not_fail() {
+        let s = subscription(
+            r#"{"_id":"s1","_updatedAt":{"$date":1},"rid":"r","t":"p",
+                "u":{"_id":"u1","username":"bob"},"ts":{"$date":1},"name":"x",
+                "open":false,"unread":0,"userMentions":0,"groupMentions":0,
+                "desktopNotifications":"whisper","status":"EXPELLED"}"#,
+        );
+        assert!(s.desktop_notifications.unwrap().is_unknown());
+        assert!(s.status.unwrap().is_unknown());
+    }
+
+    // -- User ----------------------------------------------------------------------------
+
+    #[test]
+    fn decodes_a_user_from_the_narrowest_projection() {
+        // The streamer's publication cache projects `{_id: 1, roles: 1}` — no `_updatedAt`.
+        let u = user(r#"{"_id":"u1","roles":["admin","user"]}"#);
+
+        assert_eq!(u.id, "u1");
+        assert_eq!(u.updated_at, None);
+        assert!(u.has_role("admin"));
+        assert!(!u.has_role("bot"));
+        // Non-optional in core-typings, absent here.
+        assert_eq!(u.user_type, None);
+        assert_eq!(u.active, None);
+    }
+
+    #[test]
+    fn decodes_a_name_changed_payload() {
+        // `Users:NameChanged` carries only `{_id, name, username}`.
+        let u = user(r#"{"_id":"u1","name":"Alice A.","username":"alice"}"#);
+
+        assert_eq!(u.display_name(true), Some("Alice A."));
+        assert_eq!(u.display_name(false), Some("alice"));
+        assert_eq!(u.roles, None);
+        // Absent roles are not the same as "holds no roles".
+        assert!(!u.has_role("admin"));
+    }
+
+    #[test]
+    fn decodes_a_full_user_document() {
+        let u = user(
+            r#"{"_id":"u1","_updatedAt":{"$date":9},"createdAt":{"$date":1},
+                "username":"alice","name":"Alice A.","nickname":"ali","bio":"hi",
+                "roles":["user"],"type":"user","active":true,
+                "status":"busy","statusDefault":"online","statusConnection":"online",
+                "statusText":"in a meeting","statusSource":"manual",
+                "statusExpiresAt":{"$date":100},
+                "emails":[{"address":"a@example.com","verified":true}],
+                "utcOffset":5.5,"language":"en","avatarETag":"tag1",
+                "settings":{"preferences":{"idleTimeLimit":300}},
+                "customFields":{"team":"core"},"__rooms":["GENERAL"],
+                "roomRolePriorities":{"GENERAL":0},
+                "services":{"password":{"bcrypt":"$2b$10$secret"},
+                            "resume":{"loginTokens":[{"hashedToken":"nope"}]}}}"#,
+        );
+
+        // The three status concepts are distinct.
+        assert_eq!(u.status, Some(UserStatus::Busy));
+        assert_eq!(u.status_default, Some(UserStatus::Online));
+        assert_eq!(u.status_connection.as_deref(), Some("online"));
+        assert_eq!(u.status_source, Some(PresenceSource::Manual));
+        assert!(u.is_connected());
+
+        assert_eq!(u.utc_offset, Some(5.5));
+        assert_eq!(u.emails.as_ref().unwrap()[0].address, "a@example.com");
+        assert_eq!(u.avatar_etag.as_deref(), Some("tag1"));
+        assert_eq!(u.rooms.as_ref().unwrap()[0], "GENERAL");
+        assert_eq!(u.room_role_priorities.as_ref().unwrap()["GENERAL"], 0);
+
+        // `services` is deliberately not modelled, so credentials cannot be re-emitted.
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(!json.contains("services"), "{json}");
+        assert!(!json.contains("bcrypt"), "{json}");
+        assert!(!json.contains("secret"), "{json}");
+    }
+
+    #[test]
+    fn an_unknown_user_status_does_not_fail() {
+        let u = user(r#"{"_id":"u1","status":"hibernating"}"#);
+        assert!(u.status.clone().unwrap().is_unknown());
+        assert!(!u.is_connected());
+        assert_eq!(serde_json::to_value(&u.status).unwrap(), "hibernating");
+    }
+
+    #[test]
+    fn a_disabled_user_reports_the_disabled_status() {
+        let u = user(r#"{"_id":"u1","active":false,"status":"disabled"}"#);
+        assert_eq!(u.status, Some(UserStatus::Disabled));
+        assert!(!u.is_connected());
+    }
+
+    // -- Presence ------------------------------------------------------------------------
+
+    #[test]
+    fn decodes_the_numeric_presence_codes() {
+        // The `user-status` stream event is
+        // [uid, username, statusCode, statusText, name, roles, ...].
+        let event: (UserId, String, PresenceStatus, Option<String>) =
+            serde_json::from_str(r#"["u1","alice",2,"brb"]"#).unwrap();
+
+        assert_eq!(event.2, PresenceStatus::Away);
+        assert_eq!(event.2.as_user_status(), Some(UserStatus::Away));
+        assert_eq!(event.2.code(), 2);
+    }
+
+    #[test]
+    fn presence_codes_round_trip_including_unknown_ones() {
+        for (code, expected) in [
+            (0u8, PresenceStatus::Offline),
+            (1, PresenceStatus::Online),
+            (2, PresenceStatus::Away),
+            (3, PresenceStatus::Busy),
+            (4, PresenceStatus::Unknown(4)),
+            (200, PresenceStatus::Unknown(200)),
+        ] {
+            let decoded: PresenceStatus = serde_json::from_str(&code.to_string()).unwrap();
+            assert_eq!(decoded, expected);
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), code.to_string());
+        }
+    }
+
+    #[test]
+    fn presence_code_zero_is_ambiguous() {
+        // The server maps both `offline` and `disabled` to 0, so a disabled account is
+        // indistinguishable from an offline one on the presence stream.
+        assert_eq!(PresenceStatus::from(0u8), PresenceStatus::Offline);
+        assert_eq!(PresenceStatus::from(0u8).as_user_status(), Some(UserStatus::Offline));
+        assert!(PresenceStatus::Unknown(9).as_user_status().is_none());
     }
 }

@@ -311,11 +311,17 @@ types lie — fields declared non-optional in `core-typings` are routinely dropp
 
 Genuinely always present:
 
-- `IMessage`: `_id`, `_updatedAt`, `rid`, `msg`, `ts`, `u{_id, username}`
+- `IMessage`: `_id`, `_updatedAt`, `rid`, `msg`, `ts`, `u{_id}` — `u.username` is
+  optional in practice despite `IMessage` typing `u` as `Required<...>`, because
+  `IUser.username` is optional at source and partial `changed` frames can deliver a
+  stub `u`.
 - `IRoom`: `_id`, `_updatedAt`, `t`
 - `ISubscription`: `_id`, `_updatedAt`, `rid`, `u`, `t`, `ts`, `name`, `open`, `unread`,
   `userMentions`, `groupMentions`
-- `IUser`: `_id`, `_updatedAt`
+- `IUser`: `_id` **only** — corrected during implementation. `_updatedAt` is *not*
+  guaranteed: `Users:NameChanged` carries `Pick<IUser, '_id'|'name'|'username'>`
+  (`streams.ts:223`) and the user cache projects `{_id, roles}`
+  (`publication-user-cache.ts`).
 
 **Everything else is `Option<T>` + `#[serde(default)]`.** Notably `IRoom.msgs`/`usersCount`
 and `IUser.roles`/`type`/`active` are non-optional in TS but *are* dropped by stream
