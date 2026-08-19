@@ -15,3 +15,4 @@ pub use self::backoff::Backoff;
 pub use self::correlate::{CallError, Correlator, Epoch, Resolution};
 pub use self::liveness::{Liveness, LivenessPolicy};
 pub use self::session::{Action, Fatal, Phase, Session};
+pub use self::subscription::{Registry, StreamKey, SubState};
