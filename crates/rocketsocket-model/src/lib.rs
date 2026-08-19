@@ -20,8 +20,10 @@
 
 pub mod datetime;
 pub mod entity;
+pub mod event;
 pub mod id;
 pub mod protocol;
 
 pub use self::datetime::Timestamp;
+pub use self::event::{StreamEvent, catalog};
 pub use self::id::{Id, MessageId, RoleId, RoomId, SubscriptionId, UploadId, UserId, marker};
