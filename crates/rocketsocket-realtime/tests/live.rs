@@ -103,7 +103,7 @@ async fn a_real_server_accepts_the_catch_all_subscription_and_sends_messages() {
 
     let seen = tokio::time::timeout(Duration::from_secs(30), async {
         while let Some(event) = events.recv().await {
-            if let ClientEvent::Stream { key, args } = event
+            if let ClientEvent::Stream { key, args, .. } = event
                 && key.event == "__my_messages__"
             {
                 assert!(!args.is_empty(), "a message event must carry a payload");

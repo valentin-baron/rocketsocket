@@ -114,7 +114,11 @@ mod tests {
     use crate::subscription::StreamKey;
 
     fn stream_event(stream: &str, event: &str) -> ClientEvent {
-        ClientEvent::Stream { key: StreamKey::new(stream, event), args: Vec::new() }
+        ClientEvent::Stream {
+            key: StreamKey::new(stream, event),
+            event: rocketsocket_model::event::StreamEvent::decode(stream, event, &[]),
+            args: Vec::new(),
+        }
     }
 
     #[tokio::test]

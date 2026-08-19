@@ -14,6 +14,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, warn};
 
+use rocketsocket_model::event::StreamEvent;
 use rocketsocket_model::protocol::ServerMessage;
 
 use crate::connection::{Config, Connection, Event, Events};
@@ -24,16 +25,22 @@ use crate::subscription::{Registry, StreamKey};
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ClientEvent {
-    /// A Rocket.Chat stream event, already identified.
+    /// A Rocket.Chat stream event.
     ///
-    /// `args` is positional and its arity varies by stream and by server version, so it is
-    /// handed over as-is. `__my_messages__` appends a trailing metadata element that
-    /// per-room subscriptions do not have, and EJSON leaves `null` holes where a value was
-    /// `undefined`.
+    /// [`event`](Self::Stream::event) is the decoded form, which is what most code should
+    /// match on. Decoding never fails: an unmodelled stream, an unexpected arity or a
+    /// payload that does not fit falls through to [`StreamEvent::Unknown`] with the raw
+    /// arguments intact, so a server that grows an event cannot break a running bot.
+    ///
+    /// [`args`](Self::Stream::args) is kept alongside it because the typed layer covers 15
+    /// of the 80 declared `(stream, event)` pairs; everything else is only reachable
+    /// positionally. It is also the escape hatch when this crate's model lags the server.
     Stream {
         /// Which stream and event key this came from.
         key: StreamKey,
-        /// The positional payload from `fields.args`.
+        /// The decoded event.
+        event: StreamEvent,
+        /// The raw positional payload from `fields.args`, exactly as received.
         args: Vec<Value>,
     },
 
@@ -167,7 +174,10 @@ async fn supervise(
             Event::Frame(ref frame) => {
                 if let Some(stream) = frame.as_stream_event() {
                     let key = StreamKey::new(stream.stream, stream.event_name);
-                    let event = ClientEvent::Stream { key, args: stream.args.to_vec() };
+                    let decoded =
+                        StreamEvent::decode(stream.stream, stream.event_name, stream.args);
+                    let event =
+                        ClientEvent::Stream { key, event: decoded, args: stream.args.to_vec() };
                     if tx.send(event).await.is_err() {
                         return;
                     }

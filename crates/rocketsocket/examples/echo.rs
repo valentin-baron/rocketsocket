@@ -10,6 +10,7 @@
 //! `api-bypass-rate-limit`, and without it Rocket.Chat's default limiter allows ten
 //! requests per minute per route, which a bot exhausts immediately.
 
+use rocketsocket::model::event::StreamEvent;
 use rocketsocket::prelude::*;
 use rocketsocket::realtime::client::ClientEvent;
 use rocketsocket::rest::chat::SendMessage;
@@ -30,16 +31,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("listening");
 
     while let Some(event) = events.recv().await {
-        let ClientEvent::Stream { key, args } = event else {
+        let ClientEvent::Stream { event, .. } = event else {
             continue;
         };
-        if key.event != "__my_messages__" {
-            continue;
-        }
 
-        // `args` is positional: [message, {roomParticipant, roomType, roomName}].
-        let Some(raw) = args.first() else { continue };
-        let Ok(message) = serde_json::from_value::<Message>(raw.clone()) else {
+        // One typed variant instead of indexing a positional array. `MyMessage` carries the
+        // trailing metadata element that per-room subscriptions do not have.
+        let StreamEvent::MyMessage { message, .. } = event else {
             continue;
         };
 

@@ -183,10 +183,18 @@ async fn a_stream_event_reaches_the_application_after_a_replay() {
 
     loop {
         match tokio::time::timeout(BOUND, events.recv()).await.expect("timed out") {
-            Some(ClientEvent::Stream { key, args }) => {
+            Some(ClientEvent::Stream { key, args, event }) => {
                 assert_eq!(key.stream, "room-messages");
                 assert_eq!(key.event, "GENERAL");
                 assert_eq!(args[0]["msg"], "still here");
+                // The typed layer must decode it too, not just carry the raw args.
+                match event {
+                    rocketsocket_model::event::StreamEvent::RoomMessage { room, message } => {
+                        assert_eq!(room.as_str(), "GENERAL");
+                        assert_eq!(message.msg, "still here");
+                    }
+                    other => panic!("expected a typed RoomMessage, got {other:?}"),
+                }
                 return;
             }
             Some(_) => continue,
