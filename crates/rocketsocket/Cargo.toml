@@ -1,0 +1,38 @@
+[package]
+name = "rocketsocket"
+description = "A Rust framework for Rocket.Chat bots"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["realtime", "rest", "rustls-tls-native-roots"]
+realtime = ["dep:rocketsocket-realtime"]
+rest = ["dep:rocketsocket-rest"]
+rustls-tls-native-roots = [
+    "rocketsocket-realtime?/rustls-tls-native-roots",
+    "rocketsocket-rest?/rustls-tls-native-roots",
+]
+rustls-tls-webpki-roots = [
+    "rocketsocket-realtime?/rustls-tls-webpki-roots",
+    "rocketsocket-rest?/rustls-tls-webpki-roots",
+]
+native-tls = ["rocketsocket-realtime?/native-tls", "rocketsocket-rest?/native-tls"]
+
+[dependencies]
+rocketsocket-model.workspace = true
+rocketsocket-realtime = { version = "0.0.0", path = "../rocketsocket-realtime", default-features = false, optional = true }
+rocketsocket-rest = { version = "0.0.0", path = "../rocketsocket-rest", default-features = false, optional = true }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true
