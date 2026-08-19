@@ -134,8 +134,10 @@ fn slices_options_and_vecs_apply_elementwise() {
 
 // -- partial updates ---------------------------------------------------------------------
 
+/// `merge_room` is for the genuinely projected sources — chiefly the `rooms/get` method,
+/// which applies `roomFields`. It must not blank what it does not carry.
 #[test]
-fn a_partial_update_does_not_blank_known_fields() {
+fn merging_a_projected_room_does_not_blank_known_fields() {
     let cache = Cache::new();
 
     cache.update(&room(json!({
@@ -144,8 +146,7 @@ fn a_partial_update_does_not_blank_known_fields() {
         "usersCount": 12, "ro": true,
     })));
 
-    // The projection `stream-notify-user` uses carries almost nothing.
-    cache.update(&room(json!({
+    cache.merge_room(room(json!({
         "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c", "usersCount": 13,
     })));
 
@@ -158,8 +159,38 @@ fn a_partial_update_does_not_blank_known_fields() {
     assert_eq!(cached.updated_at.unix_millis(), 2);
 }
 
+/// The counterpart, and the whole point of the change: a room frame arrives whole, so
+/// `update` stores it whole and an omitted field is stored as omitted. This is how the cache
+/// learns that a topic or a description was cleared.
 #[test]
-fn a_partial_update_does_not_blank_known_fields_on_any_kind() {
+fn updating_a_room_stores_the_stream_frame_as_the_whole_truth() {
+    let cache = Cache::new();
+
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c",
+        "name": "general", "topic": "the topic", "description": "the description",
+        "usersCount": 12, "ro": true,
+    })));
+
+    // The same room after the topic and description were cleared. `notifyOnRoomChangedById`
+    // re-reads the document, so this is exactly what the stream carries.
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c", "name": "general",
+        "usersCount": 13, "ro": true,
+    })));
+
+    let cached = cache.room(&room_id("r1")).unwrap();
+    assert_eq!(cached.topic, None, "a cleared topic must not survive a complete frame");
+    assert_eq!(cached.description, None);
+    assert_eq!(cached.name.as_deref(), Some("general"));
+    assert_eq!(cached.users_count, Some(13));
+}
+
+/// The merging paths, one per entity that has one: `User` and `Subscription` through
+/// `update` (their streams project), `Message` through `merge_message` (its stream does
+/// not, so the merge is opt-in).
+#[test]
+fn the_merging_paths_do_not_blank_known_fields_on_any_kind() {
     let cache = Cache::new();
 
     cache.update(&user(json!({
@@ -197,7 +228,7 @@ fn a_partial_update_does_not_blank_known_fields_on_any_kind() {
         "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice"},
         "attachments": [{"text": "a"}], "pinned": true,
     })));
-    cache.update(&message(json!({
+    cache.merge_message(message(json!({
         "_id": "m1", "_updatedAt": {"$date": 2}, "rid": "r1", "msg": "hi there",
         "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice"},
         "editedAt": {"$date": 2},
@@ -481,8 +512,12 @@ fn the_fixture_really_is_a_tombstone() {
     assert!(tombstone("m1", "r1").is_deleted_tombstone());
 }
 
+/// A tombstone forces `StoreMode::Replace` **whatever the caller asked for**. Now that
+/// `update` already replaces, `merge_message` is the only way to reach that override — so it
+/// is what this test uses. Calling `update` here would pass without exercising the override
+/// at all.
 #[test]
-fn a_tombstone_replaces_the_body_instead_of_merging_into_it() {
+fn a_tombstone_replaces_the_body_even_on_the_merge_path() {
     let cache = Cache::new();
 
     cache.update(&message(json!({
@@ -494,7 +529,7 @@ fn a_tombstone_replaces_the_body_instead_of_merging_into_it() {
         "md": [{"type": "PARAGRAPH"}],
     })));
 
-    cache.update(&tombstone("m1", "r1"));
+    cache.merge_message(tombstone("m1", "r1"));
 
     let cached = cache.message(&message_id("m1")).expect("tombstone kept, not evicted");
     assert!(cached.is_deleted_tombstone());
@@ -516,7 +551,7 @@ fn a_tombstone_evicts_under_the_evict_policy() {
     cache.update(&plain_message("m1", "r1", "secret"));
     cache.update(&plain_message("m2", "r1", "kept"));
 
-    cache.update(&tombstone("m1", "r1"));
+    cache.merge_message(tombstone("m1", "r1"));
 
     assert!(cache.message(&message_id("m1")).is_none());
     assert_eq!(cache.room_message_ids(&room_id("r1")), vec![message_id("m2")]);
@@ -556,9 +591,26 @@ fn a_projection_without_a_name_leaves_the_name_index_alone() {
     cache.update(&room(json!({
         "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c", "name": "general",
     })));
-    cache.update(&room(json!({"_id": "r1", "_updatedAt": {"$date": 2}, "t": "c"})));
+    cache.merge_room(room(json!({"_id": "r1", "_updatedAt": {"$date": 2}, "t": "c"})));
 
     assert_eq!(cache.room_id_by_name("general"), Some(room_id("r1")));
+}
+
+/// A *complete* frame without a name means the room has no name, and the index must follow
+/// it out. The alternative — keeping the entry — would leave `room_by_name` resolving to a
+/// room whose `name` is `None`, which is an index pointing at a document that contradicts it.
+#[test]
+fn a_complete_frame_without_a_name_drops_the_name_index_entry() {
+    let cache = Cache::new();
+
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c", "name": "general",
+    })));
+    cache.update(&room(json!({"_id": "r1", "_updatedAt": {"$date": 2}, "t": "c"})));
+
+    assert_eq!(cache.room_id_by_name("general"), None);
+    assert!(cache.room_by_name("general").is_none());
+    assert!(cache.room(&room_id("r1")).expect("still cached").name.is_none());
 }
 
 #[test]
@@ -724,8 +776,10 @@ async fn a_write_proceeds_once_no_guard_is_held() {
     let writer = {
         let cache = Arc::clone(&cache);
         tokio::spawn(async move {
+            // A room frame is a whole document, so the fixture is one.
             cache.update(&room(json!({
-                "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c", "topic": "written",
+                "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c", "name": "general",
+                "topic": "written",
             })));
         })
     };
@@ -935,11 +989,12 @@ fn a_subscription_missing_a_required_counter_does_not_decode_to_a_default() {
     assert!(decoded.is_err(), "a missing groupMentions must not silently become 0");
 }
 
-/// `Option<Vec<T>>`: `[]` is carried and overwrites, an omission is not. Both halves matter,
-/// and the server uses both — `$pull` leaves `[]` (`Rooms.removeMutedUsernameByRoomId`)
-/// while `$unset` removes the key (`Rooms.setSystemMessagesById`, Rooms.ts:1015).
+/// `Option<Vec<T>>` under a **merge**: `[]` is carried and overwrites, an omission is not.
+/// The server uses both — `$pull` leaves `[]` (`Rooms.removeMutedUsernameByRoomId`) while
+/// `$unset` removes the key (`Rooms.setSystemMessagesById`, Rooms.ts:1015) — which is
+/// exactly why a merge is only safe on a source that is genuinely projected.
 #[test]
-fn an_empty_array_overwrites_but_an_omitted_one_does_not() {
+fn under_a_merge_an_empty_array_overwrites_but_an_omitted_one_does_not() {
     let cache = Cache::new();
 
     cache.update(&room(json!({
@@ -948,72 +1003,123 @@ fn an_empty_array_overwrites_but_an_omitted_one_does_not() {
     })));
 
     // `$pull` down to nothing: the key is present and empty, so it wins.
-    cache.update(&room(json!({
+    cache.merge_room(room(json!({
         "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c", "muted": [],
     })));
 
     let cached = cache.room(&room_id("r1")).expect("cached");
     assert_eq!(cached.muted.as_deref(), Some(&[][..]));
-    // `sysMes` was not carried, so it survives — correct for a projection, wrong for the
-    // `$unset` the server actually performs. See the review notes.
-    assert!(cached.sys_mes.is_some());
+    assert!(cached.sys_mes.is_some(), "an omitted key must not be treated as a clear");
+}
+
+/// The same two shapes on the stream, where they mean different things and now read
+/// differently: `muted: []` is an empty list, an absent `sysMes` is a `$unset`.
+#[test]
+fn a_complete_frame_tells_an_empty_array_apart_from_an_unset_one() {
+    let cache = Cache::new();
+
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c", "name": "general",
+        "muted": ["bob"], "sysMes": ["uj"],
+    })));
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c", "name": "general", "muted": [],
+    })));
+
+    let cached = cache.room(&room_id("r1")).expect("cached");
+    assert_eq!(cached.muted.as_deref(), Some(&[][..]), "an empty list is not an absent one");
+    assert!(cached.sys_mes.is_none(), "the `$unset` sysMes must be gone");
 }
 
 // -- 2. merge vs replace: documents that never existed on the server ----------------------
 
+/// **Regression test for the finding that motivated the merge/replace change.**
+///
 /// `stream-room-messages` does **not** project: `getMessageToBroadcast` reads the whole
-/// document (`Messages.findOneById(id)`, notifyListener.ts:443) and broadcasts it as-is.
-/// So for messages, and only for messages, an absent key really does mean "the server
-/// unset it" — and `update()` merges anyway.
+/// document (`Messages.findOneById(id)`, notifyListener.ts:442-443) and broadcasts it as-is.
+/// So for a message, an absent key really does mean "the server unset it".
 ///
-/// The realistic instance: removing the last reaction runs `delete message.reactions` plus
+/// Removing the last reaction runs `delete message.reactions` plus
 /// `Messages.unsetReactions` (setReaction.ts:54-56, Messages.ts:580-582), so the next
-/// broadcast carries no `reactions` key at all. The merge keeps the stale one.
-///
-/// BUG (reported, not fixed — the fix is a policy change, not a bug fix): the cache reports
-/// a reaction that no longer exists.
+/// broadcast carries no `reactions` key at all. `update` used to merge, and the cache went
+/// on reporting a reaction nobody held — a user-visible wrong answer on the single most
+/// common message mutation there is.
 #[test]
-fn unreacting_leaves_a_stale_reaction_in_the_cache() {
+fn unreacting_clears_the_reaction_from_the_cache() {
     let cache = Cache::new();
 
-    let with_reaction = message(json!({
+    cache.update(&message(json!({
         "_id": "m1", "_updatedAt": {"$date": 1}, "rid": "r1", "msg": "hi",
         "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice"},
         "reactions": {":tada:": {"usernames": ["alice"]}},
-    }));
-    cache.update(&with_reaction);
+    })));
+    assert!(cache.message(&message_id("m1")).expect("cached").reactions.is_some());
 
     // The document the server broadcasts after alice removes her reaction: complete, and
     // with no `reactions` key.
-    let after_unreact = message(json!({
+    cache.update(&message(json!({
         "_id": "m1", "_updatedAt": {"$date": 2}, "rid": "r1", "msg": "hi",
         "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice"},
-    }));
-    cache.update(&after_unreact);
+    })));
 
     let cached = cache.message(&message_id("m1")).expect("cached");
-    assert!(
-        cached.reactions.is_some(),
-        "if this now fails the merge policy for messages was changed — good"
-    );
-
-    // `replace_message` is the workaround, and it is what a message feed should call.
+    assert!(cached.reactions.is_none(), "the cache still reports a reaction nobody holds");
+    assert_eq!(cached.msg, "hi");
     drop(cached);
-    cache.replace_message(after_unreact);
-    assert!(cache.message(&message_id("m1")).expect("cached").reactions.is_none());
+
+    // The ring is untouched by any of this: an edit is not an arrival.
+    assert_eq!(cache.room_message_ids(&room_id("r1")), vec![message_id("m1")]);
+
+    // And the escape hatch still merges, for a caller who knows their source is partial.
+    cache.merge_message(message(json!({
+        "_id": "m1", "_updatedAt": {"$date": 3}, "rid": "r1", "msg": "hi",
+        "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice"},
+        "reactions": {":tada:": {"usernames": ["alice"]}},
+    })));
+    cache.merge_message(message(json!({
+        "_id": "m1", "_updatedAt": {"$date": 4}, "rid": "r1", "msg": "hi",
+        "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice"},
+    })));
+    assert!(
+        cache.message(&message_id("m1")).expect("cached").reactions.is_some(),
+        "merge_message must still merge",
+    );
 }
 
-/// Two projections of the same room combined into a state the server cannot hold.
-///
-/// `Rooms.unsetTeamById` / `unsetTeamId` `$unset` `teamId`, `teamDefault` and `teamMain`
-/// (Rooms.ts:445-460), and all three are in `roomFields` (publishFields.ts), so converting a
-/// team back to a channel broadcasts a room document with those keys simply gone. The merge
-/// keeps them: the cache then holds a `teamMain: true` room with no team.
-///
-/// BUG (reported, not fixed — this is the documented "a merge cannot see a clear"
-/// limitation, cited here against the server so the cost is concrete).
+/// The other `$unset`s on a message reach the cache the same way. `Messages.setAsReadById`
+/// `$unset`s `unread` (Messages.ts:1500-1512) and
+/// `Messages.updateUsernameOfEditByUserId` `$unset`s `md` (Messages.ts:1185-1196).
 #[test]
-fn a_team_converted_back_to_a_channel_stays_a_team_in_the_cache() {
+fn the_other_message_unsets_are_observable_too() {
+    let cache = Cache::new();
+
+    cache.update(&message(json!({
+        "_id": "m1", "_updatedAt": {"$date": 1}, "rid": "r1", "msg": "hi",
+        "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice"},
+        "unread": true, "md": [{"type": "PARAGRAPH"}], "starred": [{"_id": "u1"}],
+    })));
+
+    cache.update(&message(json!({
+        "_id": "m1", "_updatedAt": {"$date": 2}, "rid": "r1", "msg": "hi",
+        "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice"},
+        // `$pull` leaves the array behind, empty, so this key really is on the wire.
+        "starred": [],
+    })));
+
+    let cached = cache.message(&message_id("m1")).expect("cached");
+    assert!(cached.unread.is_none());
+    assert!(cached.md.is_none());
+    assert_eq!(cached.starred.as_deref(), Some(&[][..]), "an emptied array is not an unset");
+}
+
+/// `Rooms.unsetTeamById` / `unsetTeamId` `$unset` `teamId`, `teamDefault` and `teamMain`
+/// (Rooms.ts:445-460), so converting a team back to a channel broadcasts a room document
+/// with those keys simply gone.
+///
+/// Regression test for the review finding: this used to leave the cache holding a
+/// `teamMain: true` room with no team — a document the server could not produce.
+#[test]
+fn a_team_converted_back_to_a_channel_stops_being_a_team_in_the_cache() {
     let cache = Cache::new();
 
     cache.update(&room(json!({
@@ -1027,13 +1133,16 @@ fn a_team_converted_back_to_a_channel_stays_a_team_in_the_cache() {
     })));
 
     let cached = cache.room(&room_id("r1")).expect("cached");
-    assert_eq!(cached.team_main, Some(true), "stale: the room is no longer a team");
-    assert_eq!(cached.team_id.as_deref(), Some("t1"));
+    assert_eq!(cached.team_main, None, "the room is no longer a team");
+    assert_eq!(cached.team_id, None);
+    assert_eq!(cached.team_default, None);
 }
 
 /// The shallow merge is right for `u` and `lastMessage`: Meteor resends whole subdocuments.
-/// Pin the `lastMessage` half, which the existing tests do not cover — a room update that
-/// carries a newer `lastMessage` must not leave fields of the older one behind.
+/// Pin the `lastMessage` half — a room merge that carries a newer `lastMessage` must not
+/// leave fields of the older one behind. This is a property of the *merge*, so it is
+/// exercised through `merge_room`; `update` replaces and cannot blend two subdocuments at
+/// all.
 #[test]
 fn last_message_is_replaced_wholesale_not_merged_field_by_field() {
     let cache = Cache::new();
@@ -1047,7 +1156,7 @@ fn last_message_is_replaced_wholesale_not_merged_field_by_field() {
         },
     })));
 
-    cache.update(&room(json!({
+    cache.merge_room(room(json!({
         "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c",
         "lastMessage": {
             "_id": "m2", "_updatedAt": {"$date": 2}, "rid": "r1", "msg": "second",
@@ -1116,7 +1225,7 @@ fn the_server_shaped_tombstone_is_detected_and_strips_the_unset_fields() {
         "attachments": [{"text": "secret"}],
     })));
 
-    cache.update(&server_tombstone("m1", "r1"));
+    cache.merge_message(server_tombstone("m1", "r1"));
 
     let cached = cache.message(&message_id("m1")).expect("kept");
     assert!(cached.is_deleted_tombstone());
@@ -1159,7 +1268,7 @@ fn an_update_after_a_tombstone_is_still_treated_as_a_tombstone() {
     // whole document, still carrying `t: "rm"`.
     let mut again = server_tombstone("m1", "r1");
     again.tcount = Some(0);
-    cache.update(&again);
+    cache.merge_message(again);
 
     let cached = cache.message(&message_id("m1")).expect("kept");
     assert!(cached.is_deleted_tombstone());
@@ -1193,6 +1302,11 @@ fn evicting_a_tombstone_unlinks_from_the_rid_the_tombstone_carries() {
 /// BUG (reported, not fixed): repairing it needs a map lookup on every update whose name is
 /// unchanged — i.e. on the hottest write path — for a case that needs two rooms to share a
 /// name. Recorded here rather than fixed. See the review notes for the recommendation.
+///
+/// Re-checked after `update` was changed to replace for rooms: still reachable, and by the
+/// commonest path there is. `reindex` runs identically under both modes, and a stream frame
+/// repeats the room's name on every write, so `old == new` and the early return fires every
+/// time.
 #[test]
 fn a_name_index_entry_vacated_by_another_room_is_never_repaired() {
     let cache = Cache::new();
@@ -1645,6 +1759,11 @@ fn an_edit_to_an_evicted_message_re_enters_the_ring_as_the_newest() {
 ///
 /// BUG (reported, not fixed — it needs a caller error to reach, and the fix changes the
 /// documented "works for a message that was never cached" behaviour). See the review notes.
+///
+/// Re-checked after `update` was changed to replace for messages: unaffected. The mode only
+/// decides how the document is stored; `store_message` still links to the ring exactly when
+/// `previous.is_none()`, and `remove_message_in` still unlinks from the room it was handed
+/// rather than the one the cached document names.
 #[test]
 fn remove_message_in_with_the_wrong_room_leaves_a_dangling_ring_entry() {
     let cache = Cache::new();
@@ -1749,33 +1868,42 @@ fn a_reference_is_send_so_the_compiler_does_not_catch_the_await_hazard() {
 
 // -- 8. the merge/replace polarity against the real wire ---------------------------------
 
-/// `replace_room` is documented for "a REST response, a `rooms/get` sync". But `rooms/get`
-/// *is* the projected payload: `roomsGetMethod` passes `{ projection: roomFields }`
-/// (apps/meteor/server/publications/room/index.ts:29), and `roomFields` does not list
-/// `uids` and has `usernames` commented out (apps/meteor/lib/publishFields.ts:56-62).
+/// `rooms/get` **is** the projected payload: `roomsGetMethod` passes
+/// `{ projection: roomFields }` (apps/meteor/server/publications/room/index.ts:29), and
+/// `roomFields` does not list `uids` and has `usernames` commented out
+/// (apps/meteor/lib/publishFields.ts:56-62).
 ///
-/// So following the documentation exactly — merge the stream, replace the sync — blanks
-/// fields the cache already held.
-///
-/// BUG (reported, not fixed — the fix is to re-aim the documentation, and to say which
-/// payloads really are complete).
+/// So it is the one that needs `merge_room`, and `replace_room` on it blanks what the cache
+/// already held. Both halves are asserted, because the review found the documentation
+/// pointing callers at the wrong one.
 #[test]
-fn replacing_with_a_rooms_get_payload_drops_the_fields_that_projection_omits() {
-    let cache = Cache::new();
-
+fn a_rooms_get_payload_wants_merge_room_and_not_replace_room() {
     // A full room, e.g. from `channels.info`, which is not projected.
-    cache.update(&room(json!({
+    let full = json!({
         "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c", "name": "general",
         "uids": ["u1", "u2"], "usernames": ["alice", "bob"], "topic": "hi",
-    })));
-
+    });
     // What `rooms/get` actually returns for the same room.
-    cache.replace_room(room(json!({
+    let projected = json!({
         "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c", "name": "general", "topic": "hi",
-    })));
+    });
+
+    let cache = Cache::new();
+    cache.update(&room(full.clone()));
+    cache.merge_room(room(projected.clone()));
 
     let cached = cache.room(&room_id("r1")).expect("cached");
-    assert!(cached.uids.is_none(), "current behaviour: the projection blanked uids");
+    assert_eq!(cached.uids.as_deref(), Some(&[UserId::new("u1"), UserId::new("u2")][..]));
+    assert!(cached.usernames.is_some(), "the projection blanked usernames");
+    assert_eq!(cached.updated_at.unix_millis(), 2, "carried fields still win");
+    drop(cached);
+
+    let cache = Cache::new();
+    cache.update(&room(full));
+    cache.replace_room(room(projected));
+
+    let cached = cache.room(&room_id("r1")).expect("cached");
+    assert!(cached.uids.is_none(), "replace_room on a projection is lossy, by construction");
     assert!(cached.usernames.is_none());
 }
 
@@ -1786,12 +1914,15 @@ fn replacing_with_a_rooms_get_payload_drops_the_fields_that_projection_omits() {
 /// (apps/meteor/server/modules/listeners/listeners.module.ts:335-340). Direct callers do the
 /// same: `archiveRoom` passes `Rooms.findOneById(rid)`.
 ///
-/// So on the room stream an absent key really does mean "unset", and `update()` cannot see
-/// it. `Rooms.setSystemMessagesById` (packages/models/src/models/Rooms.ts:1015) and
-/// `Rooms.unsetTeamId` (Rooms.ts:445) are two `$unset`s that reach it; the announcement is
-/// pinned here because it is the one a bot is most likely to read back.
+/// So on the room stream an absent key really does mean "unset" — and now that `update`
+/// replaces, the cache sees it. `Rooms.setSystemMessagesById`
+/// (packages/models/src/models/Rooms.ts:1015) and `Rooms.unsetTeamId` (Rooms.ts:445) are two
+/// `$unset`s that reach it; the announcement is pinned here because it is the one a bot is
+/// most likely to read back.
+///
+/// Regression test for the review finding that `update` merged these away.
 #[test]
-fn a_cleared_field_on_the_full_room_stream_document_survives_the_merge() {
+fn a_cleared_field_on_the_full_room_stream_document_is_observable() {
     let cache = Cache::new();
 
     cache.update(&room(json!({
@@ -1804,18 +1935,25 @@ fn a_cleared_field_on_the_full_room_stream_document_survives_the_merge() {
         "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c", "name": "general", "topic": "hi",
     })));
 
+    let cached = cache.room(&room_id("r1")).expect("cached");
+    assert!(cached.announcement.is_none(), "the cleared announcement is still cached");
+    assert_eq!(cached.topic.as_deref(), Some("hi"), "a carried field must survive");
+    drop(cached);
+
+    // `merge_room` is the wrong tool for a stream frame, and this is why: it cannot see the
+    // clear. Keeping the contrast in the test makes the choice of entry point load-bearing.
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 3}, "t": "c", "name": "general",
+        "announcement": "back", "topic": "hi",
+    })));
+    cache.merge_room(room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 4}, "t": "c", "name": "general", "topic": "hi",
+    })));
     assert_eq!(
         cache.room(&room_id("r1")).expect("cached").announcement.as_deref(),
-        Some("maintenance at 5"),
-        "current behaviour: the cleared announcement is still cached",
+        Some("back"),
+        "a merge cannot observe a clear; that is the trade it makes",
     );
-
-    // `replace_room` is the only escape, and it is correct here precisely because the stream
-    // payload is complete.
-    cache.replace_room(room(json!({
-        "_id": "r1", "_updatedAt": {"$date": 3}, "t": "c", "name": "general", "topic": "hi",
-    })));
-    assert!(cache.room(&room_id("r1")).expect("cached").announcement.is_none());
 }
 
 // -- 9. the merge invariant, checked against the model's source ---------------------------
@@ -1982,7 +2120,7 @@ fn renamed_fields_merge_under_their_wire_names() {
         "_id": "m1", "_updatedAt": {"$date": 1}, "rid": "r1", "msg": "hi",
         "ts": {"$date": 1}, "u": {"_id": "u1"}, "_hidden": true,
     })));
-    cache.update(&plain_message("m1", "r1", "edited"));
+    cache.merge_message(plain_message("m1", "r1", "edited"));
     assert_eq!(cache.message(&message_id("m1")).expect("cached").hidden, Some(true));
 
     cache.update(&subscription(json!({

@@ -20,10 +20,18 @@
 //! // The lookup every Rocket.Chat bot makes.
 //! let id = cache.room_id_by_name("general").expect("cached");
 //!
-//! // A projected update that carries no topic must not blank the one we know.
+//! // Room frames arrive whole, so `update` stores the payload as the whole truth: this
+//! // one carries no topic, which means the topic was cleared.
+//! let cleared: Room =
+//!     serde_json::from_str(r#"{"_id":"GENERAL","_updatedAt":{"$date":2},"t":"c","name":"general"}"#)?;
+//! cache.update(&cleared);
+//! assert_eq!(cache.room(&id).unwrap().topic, None);
+//!
+//! // A genuinely projected payload — `rooms/get` — must not blank what it omits.
+//! cache.update(&room);
 //! let projected: Room =
-//!     serde_json::from_str(r#"{"_id":"GENERAL","_updatedAt":{"$date":2},"t":"c"}"#)?;
-//! cache.update(&projected);
+//!     serde_json::from_str(r#"{"_id":"GENERAL","_updatedAt":{"$date":3},"t":"c"}"#)?;
+//! cache.merge_room(projected);
 //!
 //! assert_eq!(cache.room(&id).unwrap().topic.as_deref(), Some("hi"));
 //! # Ok::<(), serde_json::Error>(())
@@ -38,19 +46,34 @@
 //!
 //! # Five things to know before you use it
 //!
-//! ## 1. Partial updates merge; they do not replace
+//! ## 1. Some entities merge and some replace, because the streams differ
 //!
-//! Rocket.Chat projects documents per publication. The same room arrives with different
-//! field sets from different streams, and every projected-away field decodes to `None` —
-//! indistinguishable from "the server says this is empty". So [`Cache::update`] **merges**:
-//! a field the payload did not carry keeps its cached value, and only fields the payload
-//! actually carried are written. Nested objects and arrays are replaced wholesale, matching
-//! what Meteor's own diffing does.
+//! Every projected-away field decodes to `None`, indistinguishable from "the server says
+//! this is empty". So whether [`Cache::update`] may treat an absent key as a *clear* depends
+//! entirely on whether the stream that produced the payload projects — and Rocket.Chat is
+//! not consistent about it:
 //!
-//! The consequence is that a merge cannot see a field being *cleared*. When you have a
-//! complete document — a REST response, a `rooms/get` sync — use [`Cache::replace_room`],
-//! [`Cache::replace_user`], [`Cache::replace_subscription`] or [`Cache::replace_message`],
-//! which store it as the whole truth.
+//! | Entity | [`Cache::update`] | Why |
+//! |---|---|---|
+//! | [`Room`](rocketsocket_model::entity::Room) | replaces | `notifyOnRoomChangedById` reads `Rooms.findByIds` with **no** projection |
+//! | [`Message`](rocketsocket_model::entity::Message) | replaces | `getMessageToBroadcast` reads `Messages.findOneById` with **no** projection |
+//! | [`Subscription`](rocketsocket_model::entity::Subscription) | merges | the notify path projects `subscriptionFields` |
+//! | [`User`](rocketsocket_model::entity::User) | merges | `watch.users` sends `{diff, unset}`, never a document |
+//!
+//! Where it replaces, a field the payload omits is stored as omitted — which is the point:
+//! it is how the cache learns that a topic was cleared, a team was unmade or a last reaction
+//! was removed. Where it merges, a field the payload did not carry keeps its cached value,
+//! and nested objects and arrays are still replaced wholesale, matching what Meteor's own
+//! diffing does.
+//!
+//! The two escape hatches exist for sources that do not match their entity's default. The
+//! projected ones — the `rooms/get` method applies `roomFields`, which omits `uids` and
+//! `usernames` — want [`Cache::merge_room`] or [`Cache::merge_message`]. A complete
+//! subscription or user, reconciled from a REST response, wants
+//! [`Cache::replace_subscription`] or [`Cache::replace_user`].
+//!
+//! A merge can never see a field being *cleared*. That is the price of using one, and it is
+//! why only the two genuinely-projected entities pay it.
 //!
 //! ## 2. Deletions arrive only on a stream, never as a message update
 //!

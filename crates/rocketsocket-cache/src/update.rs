@@ -14,12 +14,14 @@ use crate::cache::{Cache, StoreMode};
 /// through interior mutability, and a shared `Arc<Cache>` can be updated from the event
 /// loop while handlers read it.
 ///
-/// # Applying a payload merges
+/// # Whether a payload merges or replaces is decided per entity, not globally
 ///
-/// Rocket.Chat projects documents per publication, so a payload's `None` usually means "not
-/// carried" rather than "empty" and must not blank what is already cached. See the crate-level documentation on partial
-/// updates. Use [`Cache::replace_room`] and its siblings for a
-/// complete document.
+/// It depends on whether the stream that carries it projects. `Room` and `Message` arrive
+/// **whole** and therefore replace; `Subscription` and `User` arrive **partial** and
+/// therefore merge. Each impl below states which it is and cites the server code that
+/// settles it. See the crate-level documentation for the consequences, and
+/// [`Cache::merge_room`] / [`Cache::replace_subscription`] for the escape hatches when a
+/// particular source does not match its entity's default.
 ///
 /// # Implementing it
 ///
@@ -64,6 +66,22 @@ impl UpdateCache for Room {
 }
 
 impl UpdateCache for User {
+    /// Merges, like [`Subscription`] and unlike [`Room`] and [`Message`].
+    ///
+    /// A user document never arrives whole on a stream after login. `notifyOnUserChange`
+    /// broadcasts `{ id, diff, unset }` for every `updated` action and only attaches a whole
+    /// `data` for `inserted` (`server/lib/notifyListener.ts:377-389`), and the listener
+    /// forwards exactly that to `userData` (`server/modules/listeners/listeners.module.ts`).
+    /// The other sources are narrower still: `Users:NameChanged` sends
+    /// `Pick<IUser, '_id' | 'name' | 'username'>`, and the publication user cache projects
+    /// `{_id: 1, roles: 1}`. Replacing on any of those would blank the rest of the document.
+    ///
+    /// Note the asymmetry this leaves. The wire *does* say which fields were cleared — that
+    /// is what the `unset` member of the payload is — but a [`User`] has nowhere to put it,
+    /// so a `User`-shaped payload cannot express a clear and this merge cannot see one. A
+    /// caller that decodes `unset` itself should apply it with
+    /// [`Cache::replace_user`](Cache::replace_user) on a document it has reconciled.
+    ///
     /// Also refreshes [`Cache::current_user`] when this is the logged-in user, so the two
     /// copies cannot drift.
     fn update(&self, cache: &Cache) {
@@ -86,7 +104,17 @@ impl UpdateCache for Subscription {
 }
 
 impl UpdateCache for Message {
-    /// Note what this does **not** do: it does not cache [`Message::u`] as a user.
+    /// Replaces rather than merges, for the same reason as [`Room`].
+    ///
+    /// `getMessageToBroadcast` reads `Messages.findOneById(id)` with no projection
+    /// (`server/lib/notifyListener.ts:442-443`), so a message arrives whole. And removing
+    /// the last reaction runs `delete message.reactions` plus `Messages.unsetReactions`
+    /// (`app/reactions/server/setReaction.ts:54-56`), which a merge cannot see: the cache
+    /// would keep showing a reaction nobody holds.
+    ///
+    /// Use [`Cache::merge_message`] for a source you know to be partial.
+    ///
+    /// # What this does **not** do: it does not cache [`Message::u`] as a user
     ///
     /// `u` is a three-field stub (`_id`, `username?`, `name?`), not a user document.
     /// Storing it as one would fill the users map with entries that answer
@@ -95,13 +123,6 @@ impl UpdateCache for Message {
     /// worse than a miss, since a miss at least routes to the server. It would also churn
     /// the user eviction queue once per message. Cache the author yourself if you want it,
     /// from a real `users.info`.
-    /// Replaces rather than merges, for the same reason as [`Room`].
-    ///
-    /// `getMessageToBroadcast` reads `Messages.findOneById(id)` with no projection
-    /// (`server/lib/notifyListener.ts:442-443`), so a message arrives whole. And removing
-    /// the last reaction runs `delete message.reactions` plus `Messages.unsetReactions`
-    /// (`app/reactions/server/setReaction.ts:54-56`), which a merge cannot see: the cache
-    /// would keep showing a reaction nobody holds.
     fn update(&self, cache: &Cache) {
         cache.store_message(self.clone(), StoreMode::Replace);
     }
