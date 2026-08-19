@@ -2059,7 +2059,7 @@ mod tests {
         let three = StreamEvent::decode(
             "stream-notify-logged",
             "user-status",
-            &args(&[json!([["uid1", "john", 1]])[0].clone()]),
+            &args(&[json!(["uid1", "john", 1])]),
         );
         let StreamEvent::UserStatusChanged(status) = three else {
             panic!("3-element form must decode — servers in the support window still send it");

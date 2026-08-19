@@ -830,3 +830,20 @@ fn debug_prints_the_shape_not_the_contents() {
     assert!(rendered.contains("rooms: 1"));
     assert!(!rendered.contains("general"));
 }
+
+#[test]
+fn the_cache_is_shareable_across_threads() {
+    fn assert_shareable<T: Send + Sync + 'static>() {}
+    assert_shareable::<Cache>();
+}
+
+#[test]
+fn a_removed_user_does_not_take_the_current_user_with_it() {
+    let cache = Cache::new();
+    cache.set_current_user(user(json!({"_id": "me", "username": "bot"})));
+
+    cache.remove_user(&user_id("me"));
+
+    assert!(cache.user(&user_id("me")).is_none());
+    assert_eq!(cache.current_user_id(), Some(user_id("me")));
+}

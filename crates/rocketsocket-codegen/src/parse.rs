@@ -568,3 +568,147 @@ fn truncate(text: &str, max: usize) -> String {
     }
     format!("{}…", &text[..cut])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::VENDORED_STREAMS_TS;
+
+    fn catalog() -> Catalog {
+        parse(VENDORED_STREAMS_TS).expect("the vendored copy parses")
+    }
+
+    #[test]
+    fn the_vendored_catalog_parses_completely() {
+        let catalog = catalog();
+        assert_eq!(catalog.streams.len(), 17);
+        assert_eq!(catalog.event_count(), 80);
+        // Both ends of the interface, so a truncated read would be caught.
+        assert_eq!(catalog.streams[0].name, "roles");
+        assert_eq!(catalog.streams[16].name, "local");
+    }
+
+    #[test]
+    fn composite_keys_are_recognised_as_templates() {
+        let notify_room = catalog().stream("notify-room").expect("declared").clone();
+        assert_eq!(notify_room.events.len(), 8);
+        assert_eq!(notify_room.events[0].key, KeyPattern::Suffix("user-activity".to_owned()));
+        assert_eq!(notify_room.events[1].key, KeyPattern::Suffix("typing".to_owned()));
+
+        let queue = catalog().stream("livechat-inquiry-queue-observer").expect("declared").clone();
+        assert_eq!(queue.events[0].key, KeyPattern::Literal("public".to_owned()));
+        assert_eq!(queue.events[1].key, KeyPattern::Prefix("department".to_owned()));
+        assert_eq!(queue.events[3].key, KeyPattern::Any, "`${string}` is a free key");
+
+        let messages = catalog().stream("room-messages").expect("declared").clone();
+        assert_eq!(messages.events[0].key, KeyPattern::Literal("__my_messages__".to_owned()));
+        assert_eq!(messages.events[1].key, KeyPattern::Any, "bare `string` is a free key");
+    }
+
+    /// The commas inside `Pick<IUser, '_id' | 'name'>` belong to the generic argument list,
+    /// not to the tuple. Counting them would report arity 2 for a one-element tuple.
+    #[test]
+    fn generic_arguments_do_not_inflate_the_arity() {
+        let logged = catalog().stream("notify-logged").expect("declared").clone();
+        let name_changed = logged
+            .events
+            .iter()
+            .find(|event| event.key == KeyPattern::Literal("Users:NameChanged".to_owned()))
+            .expect("declared");
+        assert_eq!(name_changed.args.arities, vec![1]);
+        assert_eq!(name_changed.args.source, "[Pick<IUser, '_id' | 'name' | 'username'>]");
+    }
+
+    #[test]
+    fn a_union_of_tuples_reports_every_arity_it_can_have() {
+        let all = catalog().stream("notify-all").expect("declared").clone();
+        let license = all
+            .events
+            .iter()
+            .find(|event| event.key == KeyPattern::Literal("license".to_owned()))
+            .expect("declared");
+        assert_eq!(license.args.arities, vec![0, 1]);
+        assert!(!license.args.variadic);
+
+        let local = catalog().stream("local").expect("declared").clone();
+        assert!(local.events[0].args.variadic, "`any[]` has no fixed arity");
+        assert!(local.events[0].args.arities.is_empty());
+    }
+
+    #[test]
+    fn comments_do_not_reach_the_parser() {
+        // `notify-room` ends with a commented-out entry and `notify-logged` has a
+        // `/* @deprecated */` marker between two live ones.
+        assert_eq!(catalog().stream("notify-room").expect("declared").events.len(), 8);
+        assert_eq!(catalog().stream("notify-logged").expect("declared").events.len(), 14);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Failing loudly
+    // -----------------------------------------------------------------------------------
+
+    fn interface(body: &str) -> String {
+        format!("export interface StreamerEvents {{\n{body}\n}}\n")
+    }
+
+    #[test]
+    fn a_shape_the_parser_does_not_understand_is_an_error_not_a_skip() {
+        let cases = [
+            // An entry member that is neither `key` nor `args`.
+            "'s': [{ key: 'k'; args: []; deprecated: true }];",
+            // A value that is not an array of entries.
+            "'s': SomeOtherType;",
+            // An entry that is not an object.
+            "'s': [SomeEntry];",
+            // A key form with no fixed part to match on.
+            "'s': [{ key: `${string}x${string}`; args: [] }];",
+            // A key that is not a string at all.
+            "'s': [{ key: 42; args: [] }];",
+            // An args type that is neither a tuple nor an array.
+            "'s': [{ key: 'k'; args: Foo }];",
+            // A missing member.
+            "'s': [{ key: 'k' }];",
+            "'s': [{ args: [] }];",
+            // An unbalanced delimiter.
+            "'s': [{ key: 'k'; args: [Foo };",
+        ];
+        for case in cases {
+            let source = interface(case);
+            let error = parse(&source).expect_err(&format!("`{case}` must not parse"));
+            assert!(!error.message.is_empty());
+            assert!(error.line >= 1);
+        }
+    }
+
+    #[test]
+    fn a_stream_declaring_no_events_is_an_error() {
+        // Silently accepting this would produce a stream nothing can ever match.
+        parse(&interface("'s': [];")).expect_err("an empty stream must not parse");
+    }
+
+    #[test]
+    fn a_missing_interface_is_an_error() {
+        parse("export type Foo = 1;").expect_err("no StreamerEvents means no catalog");
+    }
+
+    #[test]
+    fn the_error_points_at_the_offending_line() {
+        let source = interface("'a': [{ key: 'k'; args: [] }];\n'b': [{ key: 'k'; oops: [] }];");
+        let error = parse(&source).expect_err("must not parse");
+        assert_eq!(error.line, 3, "line 1 is the interface header");
+        assert!(error.message.contains("oops"), "{}", error.message);
+        assert!(error.context.contains("oops"));
+    }
+
+    #[test]
+    fn strings_containing_delimiters_do_not_confuse_the_scanner() {
+        let catalog = parse(&interface(
+            "'s': [{ key: 'a/b}]'; args: [{ x: 'y;z' }] }, { key: 'c'; args: [A, B] }];",
+        ))
+        .expect("parses");
+        let stream = &catalog.streams[0];
+        assert_eq!(stream.events.len(), 2);
+        assert_eq!(stream.events[0].key, KeyPattern::Literal("a/b}]'".to_owned()));
+        assert_eq!(stream.events[1].args.arities, vec![2]);
+    }
+}
