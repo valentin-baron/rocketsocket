@@ -137,6 +137,14 @@ pub struct Config {
     pub backoff_base: Duration,
     /// Ceiling on the reconnect window.
     pub backoff_cap: Duration,
+    /// How long a session must stay `Ready` before its success clears the reconnect
+    /// backoff.
+    ///
+    /// Guards against a server that completes the handshake and immediately drops the
+    /// socket — an overloaded node, a proxy killing long-lived connections, a bot whose
+    /// account is being logged out elsewhere. Clearing the backoff on login alone would
+    /// make that a hot reconnect loop at full speed, forever.
+    pub stable_after: Duration,
 }
 
 impl Config {
@@ -155,6 +163,7 @@ impl Config {
             event_capacity: 1024,
             backoff_base: Backoff::DEFAULT_BASE,
             backoff_cap: Backoff::DEFAULT_CAP,
+            stable_after: Duration::from_secs(30),
         }
     }
 }
@@ -296,8 +305,20 @@ impl Connection {
     ///
     /// The consumer is subscribed *before* the runner starts, so no event is missed. Must
     /// be called from within a Tokio runtime.
+    ///
+    /// # Panics
+    /// Panics if [`Config::dead_after`] is not greater than [`Config::ping_after`]; see
+    /// [`LivenessPolicy::with_thresholds`]. Raised here, on the caller's thread, rather
+    /// than inside the spawned task where nobody would observe it.
     #[must_use]
-    pub fn spawn(config: Config) -> (Self, Events) {
+    pub fn spawn(mut config: Config) -> (Self, Events) {
+        // Zero is not "write straight through", it is a gate that never opens: the runner
+        // stops polling the command lane once `app.len() >= outbox_capacity`, so with a
+        // capacity of zero it never polls it at all — neither `shutdown` nor the last
+        // handle dropping could ever reach it, and the task would leak forever. Clamped
+        // like the other two capacities rather than left as a foot-gun.
+        config.outbox_capacity = config.outbox_capacity.max(1);
+
         let (commands, command_rx) = mpsc::channel(config.command_capacity.max(1));
         let (events, receiver) = broadcast::channel(config.event_capacity.max(1));
         let (state_tx, state) = watch::channel(ConnectionState::Disconnected);
@@ -472,6 +493,8 @@ struct Runner {
     app: VecDeque<Outbound>,
     /// Frames handed to the sink but not yet flushed; marked sent only once they are.
     unflushed: Vec<Mark>,
+    /// When the current session reached `Ready`, for the backoff-reset rule.
+    ready_at: Option<Deadline>,
     needs_flush: bool,
 
     timer: Pin<Box<Sleep>>,
@@ -516,6 +539,7 @@ impl Runner {
             priority: VecDeque::new(),
             app: VecDeque::new(),
             unflushed: Vec::new(),
+            ready_at: None,
             needs_flush: false,
             timer: Box::pin(tokio::time::sleep(Duration::from_secs(0))),
             handshake_deadline: None,
@@ -693,8 +717,10 @@ impl Runner {
             match socket.poll_flush_unpin(cx) {
                 Poll::Ready(Ok(())) => {
                     self.needs_flush = false;
-                    // Marked only now: a frame sitting in the sink's buffer when the
-                    // socket dies never reached the server, and must settle as `NotSent`.
+                    // A flush that completed is the only proof the whole batch is on the
+                    // wire. Frames still pending here are settled by `settle()`, which
+                    // also treats them as sent — see its doc for why unflushed does not
+                    // mean unsent.
                     for mark in self.unflushed.drain(..) {
                         match mark {
                             Mark::Method(id) => self.methods.mark_sent(&id),
@@ -812,8 +838,17 @@ impl Runner {
             Action::Resubscribe => {
                 let epoch = self.methods.epoch();
                 self.handshake_deadline = None;
-                self.backoff.reset();
-                self.login_reply = None;
+                // The backoff is deliberately *not* cleared here. A login that succeeds and
+                // is dropped a moment later must not earn a zero-delay retry, or a server
+                // stuck in that state is hammered at full speed. `disconnected` clears it
+                // only once the session proved itself by lasting `stable_after`.
+                self.ready_at = Some(Deadline::now());
+                // `login_reply` is deliberately *not* dropped here. This action is applied
+                // from `on_text`, which correlates the very frame that produced it
+                // immediately afterwards; dropping the receiver first would make the login
+                // `result` resolve against a dead waiter and log the spurious "caller gone"
+                // the field exists to prevent. It is released by the next `Action::Login`
+                // or by `settle`, both of which run before it could matter.
                 self.sync_state();
                 self.emit(Event::Ready { epoch });
                 self.emit(Event::Resubscribe { epoch });
@@ -950,10 +985,29 @@ impl Runner {
     }
 
     /// Ends the current connection: drops unwritten frames and settles every waiter.
+    ///
+    /// Anything already handed to the sink settles as [`CallError::Abandoned`], never
+    /// [`CallError::NotSent`]. It is tempting to treat an unflushed frame as never sent —
+    /// it is still in tungstenite's write buffer, after all — but that is not sound:
+    /// `WebSocket::write` documents that it "will generally not flush. **However, if there
+    /// are queued automatic messages they will be written and eagerly flushed**", and an
+    /// automatic pong is queued by any inbound ping. A partially-drained flush can likewise
+    /// put the first of two buffered frames on the wire while the second is incomplete.
+    ///
+    /// So once `start_send` has accepted a frame we cannot claim the server never saw it,
+    /// and `NotSent` promises exactly that — its doc says "safe to retry". Retrying a
+    /// `sendMessage` the server did execute posts the message twice. The conservative
+    /// classification is the correct one; `NotSent` stays exact for frames held back in an
+    /// outbox, which were never handed to the sink at all.
     fn settle(&mut self) {
         self.priority.clear();
         self.app.clear();
-        self.unflushed.clear();
+        for mark in self.unflushed.drain(..) {
+            match mark {
+                Mark::Method(id) => self.methods.mark_sent(&id),
+                Mark::Sub(id) => self.subs.mark_sent(&id),
+            }
+        }
         self.needs_flush = false;
         self.login_reply = None;
         self.handshake_deadline = None;
@@ -966,6 +1020,13 @@ impl Runner {
 
     fn disconnected(&mut self, reason: &str) {
         debug!(%reason, "connection lost");
+        if let Some(ready_at) = self.ready_at.take()
+            && ready_at.elapsed() >= self.config.stable_after
+        {
+            // The session did real work before dying, so this is a fresh outage rather
+            // than a continuing one.
+            self.backoff.reset();
+        }
         self.session.disconnected();
         self.settle();
         self.set_state(ConnectionState::Disconnected);
@@ -1660,6 +1721,266 @@ mod tests {
         while tokio::time::timeout(PATIENCE, stream.next()).await.expect("stalled").is_some() {}
     }
 
+    #[tokio::test]
+    async fn a_zero_outbox_capacity_still_accepts_a_shutdown() {
+        // `outbox_capacity` gates the command lane. At zero the gate never opens, so the
+        // runner stops reading commands entirely: `shutdown` is never seen, the last handle
+        // dropping is never noticed, and the task leaks with every caller queued behind it.
+        let mut harness = Harness::start().await;
+        let (connection, mut events) = harness.spawn_with(|config| config.outbox_capacity = 0);
+
+        let mut peer = harness.accept().await;
+        peer.handshake().await;
+        wait_ready(&mut events).await;
+
+        connection.shutdown().await;
+        while next_event(&mut events).await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn the_login_result_is_delivered_to_a_live_waiter() {
+        // The login call is registered in the correlator like any other, and the runner
+        // parks its receiver so the reply lands on a waiter that still exists. Releasing it
+        // before the frame is correlated would report the login as "caller gone" every
+        // single time — the one thing the parked receiver is there to avoid.
+        let logs = Logs::default();
+        let _guard = tracing::subscriber::set_default(logs.clone());
+
+        let mut harness = Harness::start().await;
+        let (_connection, mut events) = harness.spawn();
+
+        let mut peer = harness.accept().await;
+        peer.handshake().await;
+        wait_ready(&mut events).await;
+
+        assert!(
+            logs.contains(Level::TRACE, "reply delivered"),
+            "the login reply was not delivered"
+        );
+        assert!(
+            !logs.contains(Level::TRACE, "gave up"),
+            "the login reply was resolved against a receiver the runner had already dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_settles_an_in_flight_call() {
+        let mut harness = Harness::start().await;
+        let (connection, mut events) = harness.spawn();
+
+        let mut peer = harness.accept().await;
+        peer.handshake().await;
+        wait_ready(&mut events).await;
+
+        let caller = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.call("slow", vec![]).await }
+        });
+        let id = peer.expect("method").await["id"].as_str().expect("call id").to_owned();
+
+        connection.shutdown().await;
+
+        let outcome = tokio::time::timeout(PATIENCE, caller)
+            .await
+            .expect("shutdown left the caller hanging")
+            .expect("caller task");
+        assert!(
+            matches!(&outcome, Err(CallError::Abandoned { id: seen }) if *seen == id),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_failure_settles_every_pending_caller() {
+        // A Fatal ends the runner, so it is the last chance anyone has to settle a waiter.
+        let mut harness = Harness::start().await;
+        let (connection, mut events) = harness.spawn();
+
+        let mut peer = harness.accept().await;
+        peer.expect("connect").await;
+        peer.send(json!({ "msg": "connected", "session": "session-1" })).await;
+        let login = peer.expect("method").await["id"].as_str().expect("login id").to_owned();
+
+        let caller = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.call("chat.sendMessage", vec![json!({})]).await }
+        });
+        let subscriber = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.subscribe("stream-room-messages", vec![]).await }
+        });
+        settle().await;
+
+        peer.send(json!({
+            "msg": "result",
+            "id": login,
+            "error": { "error": 403, "reason": "Incorrect password" },
+        }))
+        .await;
+        wait_for(&mut events, |event| matches!(event, Event::Fatal(_))).await;
+
+        // Neither ever reached the wire — the application lane is held behind login.
+        let call = tokio::time::timeout(PATIENCE, caller).await.expect("the caller hung");
+        assert!(matches!(call.expect("caller task"), Err(CallError::NotSent)));
+        let sub = tokio::time::timeout(PATIENCE, subscriber).await.expect("the subscriber hung");
+        assert!(matches!(sub.expect("subscriber task"), Err(CallError::NotSent)));
+    }
+
+    #[tokio::test]
+    async fn a_refused_subscription_settles_the_sub_it_answers() {
+        // `nosub` and `ready` share an id space with nothing else: method ids carry a
+        // different prefix, so a rejection can only ever settle the `sub` it names.
+        let mut harness = Harness::start().await;
+        let (connection, mut events) = harness.spawn();
+
+        let mut peer = harness.accept().await;
+        peer.handshake().await;
+        wait_ready(&mut events).await;
+
+        let subscriber = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.subscribe("stream-room-messages", vec![json!("secret")]).await }
+        });
+        let id = peer.expect("sub").await["id"].as_str().expect("sub id").to_owned();
+        peer.send(json!({
+            "msg": "nosub",
+            "id": id,
+            "error": { "error": "error-not-allowed", "reason": "Not allowed" },
+        }))
+        .await;
+
+        let outcome = tokio::time::timeout(PATIENCE, subscriber)
+            .await
+            .expect("a refused subscription left its caller hanging")
+            .expect("subscriber task");
+        assert!(matches!(outcome, Err(CallError::Server(_))), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_call_issued_between_sockets_goes_out_on_the_next_one() {
+        let mut harness = Harness::start().await;
+        let (connection, mut events) = harness.spawn();
+
+        let mut peer = harness.accept().await;
+        peer.handshake().await;
+        wait_ready(&mut events).await;
+        drop(peer);
+        wait_for(&mut events, |event| matches!(event, Event::Disconnected { .. })).await;
+
+        let caller = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.call("getRoomIdByNameOrId", vec![json!("GENERAL")]).await }
+        });
+
+        let mut second = harness.accept().await;
+        second.handshake().await;
+        let frame = second.expect("method").await;
+        assert_eq!(frame["method"], "getRoomIdByNameOrId");
+        let id = frame["id"].as_str().expect("call id").to_owned();
+        second.send(json!({ "msg": "result", "id": id, "result": "GENERAL" })).await;
+
+        let outcome = tokio::time::timeout(PATIENCE, caller).await.expect("the caller hung");
+        assert_eq!(outcome.expect("caller task").expect("result"), json!("GENERAL"));
+    }
+
+    #[tokio::test]
+    async fn a_saturated_command_lane_does_not_starve_the_liveness_timer() {
+        // The timer is polled last, after reads and commands, so an application that always
+        // has a command ready could in principle hide it forever — and a liveness deadline
+        // that never fires is a bot wedged against a server that has silently gone away.
+        let mut harness = Harness::start().await;
+        let (connection, mut events) = harness.spawn_with(|config| {
+            config.ping_after = Duration::from_millis(80);
+            config.dead_after = Duration::from_millis(160);
+        });
+
+        let mut peer = harness.accept().await;
+        peer.handshake().await;
+        wait_ready(&mut events).await;
+
+        let flooder = tokio::spawn({
+            let connection = connection.clone();
+            async move {
+                loop {
+                    connection.unsubscribe("never-subscribed").await;
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        // Drained but never answered: only the liveness deadline can end this connection.
+        let drain = tokio::spawn(async move { while peer.socket.next().await.is_some() {} });
+
+        let disconnected =
+            wait_for(&mut events, |event| matches!(event, Event::Disconnected { .. })).await;
+        flooder.abort();
+        drain.abort();
+        assert!(
+            matches!(&disconnected, Event::Disconnected { reason } if reason.contains("dead")),
+            "{disconnected:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inbound_flood_does_not_starve_the_handshake_budget() {
+        // The same starvation question from the read side: a server that talks continuously
+        // without ever answering `connect` must still run out of handshake budget.
+        let mut harness = Harness::start().await;
+        let (_connection, mut events) =
+            harness.spawn_with(|config| config.handshake_timeout = HANDSHAKE_BUDGET);
+
+        let mut peer = harness.accept().await;
+        peer.expect("connect").await;
+
+        let flooder = tokio::spawn(async move {
+            while peer.socket.send(Message::text(r#"{"msg":"server_id"}"#)).await.is_ok() {}
+        });
+
+        let disconnected =
+            wait_for(&mut events, |event| matches!(event, Event::Disconnected { .. })).await;
+        flooder.abort();
+        assert!(
+            matches!(&disconnected, Event::Disconnected { reason } if reason.contains("handshake")),
+            "{disconnected:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_every_handle_during_the_reconnect_delay_ends_the_runner() {
+        // The reconnect delay is served by `idle`, not by the socket loop, so noticing that
+        // nobody is listening any more is a second, separate code path — and a runner that
+        // missed it would sit on its task for the rest of the window, a minute by default.
+        let harness = Harness::start().await;
+        let (connection, mut events) = harness.spawn_with(|config| {
+            // Nothing listens on port 1, so every attempt fails at once and the runner
+            // spends all but a sliver of its life waiting out the delay.
+            config.url = "ws://127.0.0.1:1/websocket".to_owned();
+            config.connect_timeout = Duration::from_millis(200);
+            config.backoff_base = Duration::from_secs(30);
+            config.backoff_cap = Duration::from_secs(30);
+        });
+
+        // The first attempt is immediate by design, so this failure is what puts the runner
+        // into the delay. Dropping the handle here must end it now rather than in half a
+        // minute — and the assertion never waits on the delay itself, whose length is
+        // jittered and would make the test a coin toss.
+        wait_for(&mut events, |event| matches!(event, Event::Disconnected { .. })).await;
+
+        drop(connection);
+        while next_event(&mut events).await.is_some() {}
+    }
+
+    #[test]
+    fn truncating_a_frame_never_splits_a_character() {
+        // Reached only from the undecodable-frame path, i.e. straight from peer input, and
+        // slicing a `str` off a char boundary is a panic that kills the whole connection.
+        let text = "€".repeat(100);
+        assert!(text.len() > 256 && !text.is_char_boundary(256));
+        let cut = truncate(&text);
+        assert!(cut.ends_with('…'), "{cut}");
+        assert!(text.starts_with(cut.trim_end_matches('…')));
+        assert_eq!(truncate("short"), "short");
+    }
+
     #[test]
     fn a_credential_never_prints_its_secret() {
         let resume = format!("{:?}", Credential::Resume("super-secret".into()));
@@ -1671,5 +1992,38 @@ mod tests {
         );
         assert!(!password.contains("hunter2"), "{password}");
         assert!(password.contains("bot"));
+    }
+
+    #[tokio::test]
+    async fn a_login_then_drop_server_does_not_earn_a_zero_delay_retry() {
+        // A server that completes the handshake and immediately closes is a real shape:
+        // an overloaded node, a proxy killing long-lived connections, an account being
+        // logged out elsewhere. Clearing the backoff on login alone would reconnect to it
+        // at full speed forever, so the reset is earned by staying Ready for
+        // `stable_after`.
+        let mut harness = Harness::start().await;
+        let (_connection, mut events) = harness.spawn_with(|config| {
+            config.stable_after = Duration::from_secs(3600);
+            config.backoff_base = Duration::from_millis(1);
+            config.backoff_cap = Duration::from_millis(2);
+        });
+
+        // First attempt: reach Ready, then have the server hang up immediately.
+        let mut peer = harness.accept().await;
+        peer.handshake().await;
+        wait_ready(&mut events).await;
+        drop(peer);
+
+        // The next attempt must report a prior failure rather than starting from zero.
+        let attempt = loop {
+            match next_event(&mut events).await.expect("stream ended") {
+                Event::Connecting { attempt } => break attempt,
+                _ => continue,
+            }
+        };
+        assert!(
+            attempt >= 1,
+            "a session that never proved itself must not clear the backoff, got attempt {attempt}"
+        );
     }
 }

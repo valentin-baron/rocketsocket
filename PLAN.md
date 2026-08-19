@@ -425,6 +425,27 @@ the cache and facade layers do not assume otherwise.
    If it ever appears, the fix is a null-skipping `deserialize_with` on those fields.
    `Subscription::ts` is the next most likely instance of the same pattern.
 
+### 5.7 Known runner limitations (open)
+
+From the adversarial review of the connection runner. Recorded rather than fixed, because
+each is a loop restructure and the loop is currently correct.
+
+1. **`Shutdown` travels the application lane.** It is subject to the same `outbox_capacity`
+   gate as `call`/`subscribe`, so a control command can wait on application backpressure.
+   Bounded now that the capacity is clamped to at least 1 (the outbox drains, or
+   `dead_after` tears the socket down), but the wrong shape. Fix: a dedicated one-slot
+   control channel, polled unconditionally.
+
+2. **Shutdown is invisible for the whole of a connect attempt.** `open()` does not service
+   commands, so against an unreachable server `shutdown()` and last-handle-drop take up to
+   `connect_timeout` (15 s default) to be noticed. Fix: `select!` the connect attempt
+   against `commands.recv()`.
+
+3. **The two correlators keep independent epochs.** They are only ever bumped together in
+   `settle()`, and `Event::Ready`/`Resubscribe` report the method correlator's epoch for
+   both — correct today, but a future path that bumps one alone would silently mis-tag
+   subscriptions. Fix: one epoch owned by the runner, passed to both.
+
 ## 6. Event layer
 
 ### 6.1 Wire shape
