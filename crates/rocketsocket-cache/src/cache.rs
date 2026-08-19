@@ -128,8 +128,8 @@ impl Cache {
     /// Applies a payload.
     ///
     /// This **merges**: a field the payload did not carry keeps its cached value. See the
-    /// the crate-level documentation on partial updates module for why, and use [`Cache::replace_room`] and its
-    /// siblings when the payload is a complete document.
+    /// crate-level documentation on partial updates for why, and use [`Cache::replace_room`]
+    /// and its siblings when the payload is a complete document.
     pub fn update<T: UpdateCache + ?Sized>(&self, value: &T) {
         value.update(self);
     }
@@ -515,8 +515,9 @@ impl Cache {
                 TombstonePolicy::Evict => {
                     return self.remove_message_in(&incoming.rid, &incoming.id);
                 }
-                // Replace, never merge: the tombstone carries no attachments, urls or
-                // reactions, and merging would resurrect the content the deletion stripped.
+                // Replace, never merge: `setAsDeletedByIdAndUser` `$unset`s `md`, `blocks`
+                // and `tshow`, so those keys are absent from the tombstone and a merge
+                // would resurrect the rendered body the deletion stripped.
                 TombstonePolicy::Replace => StoreMode::Replace,
             }
         } else {

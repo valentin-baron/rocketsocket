@@ -8,7 +8,7 @@ use rocketsocket_model::entity::{Message, Room, Subscription, User};
 use rocketsocket_model::{MessageId, RoomId, UserId};
 use serde_json::{Value, json};
 
-use crate::{Cache, ResourceType, TombstonePolicy};
+use crate::{Cache, Reference, ResourceType, TombstonePolicy};
 
 // -- fixtures ----------------------------------------------------------------------------
 
@@ -851,4 +851,869 @@ fn a_removed_user_does_not_take_the_current_user_with_it() {
 
     assert!(cache.user(&user_id("me")).is_none());
     assert_eq!(cache.current_user_id(), Some(user_id("me")));
+}
+
+// ========================================================================================
+// Adversarial review, 2026-08. Each test below is either a proof of a reported finding or a
+// pin on behaviour the review checked. Findings that are *not* fixed say so in a comment.
+// ========================================================================================
+
+// -- 1. the JSON merge invariant ---------------------------------------------------------
+
+/// The whole merge rests on "a `None` field serializes to no key". Prove it for every
+/// cached type at once, not just `Room`: the sparsest legal document of each kind must
+/// serialize to exactly its required keys and nothing else.
+///
+/// If the model ever grows an `Option` field without
+/// `skip_serializing_if = "Option::is_none"`, that field appears here as a `null` key and
+/// this test fails — before it can silently blank cached data on every partial update.
+#[test]
+fn the_sparsest_document_of_every_kind_carries_only_required_keys() {
+    fn keys<T: serde::Serialize>(value: &T) -> Vec<String> {
+        match serde_json::to_value(value) {
+            Ok(Value::Object(map)) => map.keys().cloned().collect(),
+            other => panic!("entity did not serialize to a JSON object: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        keys(&room(json!({"_id": "r", "_updatedAt": {"$date": 1}, "t": "c"}))),
+        vec!["_id", "_updatedAt", "t"],
+    );
+    assert_eq!(keys(&user(json!({"_id": "u"}))), vec!["_id"]);
+    assert_eq!(
+        keys(&message(json!({
+            "_id": "m", "_updatedAt": {"$date": 1}, "rid": "r", "msg": "",
+            "ts": {"$date": 1}, "u": {"_id": "u"},
+        }))),
+        vec!["_id", "_updatedAt", "msg", "rid", "ts", "u"],
+    );
+    assert_eq!(
+        keys(&subscription(json!({
+            "_id": "s", "_updatedAt": {"$date": 1}, "rid": "r", "t": "c",
+            "ts": {"$date": 1}, "u": {"_id": "u"},
+            "open": false, "unread": 0, "userMentions": 0, "groupMentions": 0,
+        }))),
+        vec![
+            "_id",
+            "_updatedAt",
+            "groupMentions",
+            "open",
+            "rid",
+            "t",
+            "ts",
+            "u",
+            "unread",
+            "userMentions"
+        ],
+    );
+}
+
+/// The nested stubs are merged wholesale, so they only have to round-trip. They do — but
+/// `UserRef` is the one the cache actually reads back (`Message::u`), so pin it.
+#[test]
+fn a_sparse_nested_stub_also_carries_only_required_keys() {
+    let cached = message(json!({
+        "_id": "m", "_updatedAt": {"$date": 1}, "rid": "r", "msg": "hi",
+        "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice", "name": "Alice"},
+    }));
+
+    let serialized = serde_json::to_value(&cached).expect("serializes");
+    let u = serialized.get("u").expect("u is required");
+    assert_eq!(u.as_object().expect("object").len(), 3);
+}
+
+/// A projected document whose *non-`Option`* fields sit at their `Default` cannot exist:
+/// the four non-optional `Subscription` counters have no `#[serde(default)]`, so a payload
+/// that omits them fails to decode rather than decoding to zero. That is the right failure
+/// mode for a merging cache — a zero that overwrote a real unread count would be worse —
+/// but it means a projection narrower than `subscriptionFields` never reaches the cache at
+/// all, silently.
+#[test]
+fn a_subscription_missing_a_required_counter_does_not_decode_to_a_default() {
+    let narrow = r#"{"_id":"s1","_updatedAt":{"$date":1},"rid":"r1","t":"c",
+        "ts":{"$date":1},"u":{"_id":"u1"},"open":true,"unread":7,"userMentions":0}"#;
+
+    let decoded: Result<Subscription, _> = serde_json::from_str(narrow);
+    assert!(decoded.is_err(), "a missing groupMentions must not silently become 0");
+}
+
+/// `Option<Vec<T>>`: `[]` is carried and overwrites, an omission is not. Both halves matter,
+/// and the server uses both — `$pull` leaves `[]` (`Rooms.removeMutedUsernameByRoomId`)
+/// while `$unset` removes the key (`Rooms.setSystemMessagesById`, Rooms.ts:1015).
+#[test]
+fn an_empty_array_overwrites_but_an_omitted_one_does_not() {
+    let cache = Cache::new();
+
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c", "name": "general",
+        "muted": ["bob"], "sysMes": ["uj"],
+    })));
+
+    // `$pull` down to nothing: the key is present and empty, so it wins.
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c", "muted": [],
+    })));
+
+    let cached = cache.room(&room_id("r1")).expect("cached");
+    assert_eq!(cached.muted.as_deref(), Some(&[][..]));
+    // `sysMes` was not carried, so it survives — correct for a projection, wrong for the
+    // `$unset` the server actually performs. See the review notes.
+    assert!(cached.sys_mes.is_some());
+}
+
+// -- 2. merge vs replace: documents that never existed on the server ----------------------
+
+/// `stream-room-messages` does **not** project: `getMessageToBroadcast` reads the whole
+/// document (`Messages.findOneById(id)`, notifyListener.ts:443) and broadcasts it as-is.
+/// So for messages, and only for messages, an absent key really does mean "the server
+/// unset it" — and `update()` merges anyway.
+///
+/// The realistic instance: removing the last reaction runs `delete message.reactions` plus
+/// `Messages.unsetReactions` (setReaction.ts:54-56, Messages.ts:580-582), so the next
+/// broadcast carries no `reactions` key at all. The merge keeps the stale one.
+///
+/// BUG (reported, not fixed — the fix is a policy change, not a bug fix): the cache reports
+/// a reaction that no longer exists.
+#[test]
+fn unreacting_leaves_a_stale_reaction_in_the_cache() {
+    let cache = Cache::new();
+
+    let with_reaction = message(json!({
+        "_id": "m1", "_updatedAt": {"$date": 1}, "rid": "r1", "msg": "hi",
+        "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice"},
+        "reactions": {":tada:": {"usernames": ["alice"]}},
+    }));
+    cache.update(&with_reaction);
+
+    // The document the server broadcasts after alice removes her reaction: complete, and
+    // with no `reactions` key.
+    let after_unreact = message(json!({
+        "_id": "m1", "_updatedAt": {"$date": 2}, "rid": "r1", "msg": "hi",
+        "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice"},
+    }));
+    cache.update(&after_unreact);
+
+    let cached = cache.message(&message_id("m1")).expect("cached");
+    assert!(
+        cached.reactions.is_some(),
+        "if this now fails the merge policy for messages was changed — good"
+    );
+
+    // `replace_message` is the workaround, and it is what a message feed should call.
+    drop(cached);
+    cache.replace_message(after_unreact);
+    assert!(cache.message(&message_id("m1")).expect("cached").reactions.is_none());
+}
+
+/// Two projections of the same room combined into a state the server cannot hold.
+///
+/// `Rooms.unsetTeamById` / `unsetTeamId` `$unset` `teamId`, `teamDefault` and `teamMain`
+/// (Rooms.ts:445-460), and all three are in `roomFields` (publishFields.ts), so converting a
+/// team back to a channel broadcasts a room document with those keys simply gone. The merge
+/// keeps them: the cache then holds a `teamMain: true` room with no team.
+///
+/// BUG (reported, not fixed — this is the documented "a merge cannot see a clear"
+/// limitation, cited here against the server so the cost is concrete).
+#[test]
+fn a_team_converted_back_to_a_channel_stays_a_team_in_the_cache() {
+    let cache = Cache::new();
+
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c", "name": "eng",
+        "teamId": "t1", "teamMain": true, "teamDefault": false,
+    })));
+
+    // What the stream carries after `Rooms.unsetTeamId`.
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c", "name": "eng",
+    })));
+
+    let cached = cache.room(&room_id("r1")).expect("cached");
+    assert_eq!(cached.team_main, Some(true), "stale: the room is no longer a team");
+    assert_eq!(cached.team_id.as_deref(), Some("t1"));
+}
+
+/// The shallow merge is right for `u` and `lastMessage`: Meteor resends whole subdocuments.
+/// Pin the `lastMessage` half, which the existing tests do not cover — a room update that
+/// carries a newer `lastMessage` must not leave fields of the older one behind.
+#[test]
+fn last_message_is_replaced_wholesale_not_merged_field_by_field() {
+    let cache = Cache::new();
+
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c", "name": "general",
+        "lastMessage": {
+            "_id": "m1", "_updatedAt": {"$date": 1}, "rid": "r1", "msg": "first",
+            "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice"},
+            "attachments": [{"text": "a"}],
+        },
+    })));
+
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c",
+        "lastMessage": {
+            "_id": "m2", "_updatedAt": {"$date": 2}, "rid": "r1", "msg": "second",
+            "ts": {"$date": 2}, "u": {"_id": "u2", "username": "bob"},
+        },
+    })));
+
+    let cached = cache.room(&room_id("r1")).expect("cached");
+    let last = cached.last_message.as_deref().expect("carried");
+    assert_eq!(last.msg, "second");
+    assert!(last.attachments.is_none(), "the older lastMessage bled through");
+    // And the room's own fields survived the update that only carried lastMessage.
+    assert_eq!(cached.name.as_deref(), Some("general"));
+}
+
+/// A room's `lastMessage` and the message ring are independent: caching a room whose
+/// `lastMessage` the message map has never seen must not create a phantom ring entry, and
+/// removing that message must not disturb the room.
+#[test]
+fn a_rooms_last_message_is_not_fed_into_the_message_ring() {
+    let cache = Cache::new();
+
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c", "name": "general",
+        "lastMessage": {
+            "_id": "m1", "_updatedAt": {"$date": 1}, "rid": "r1", "msg": "hi",
+            "ts": {"$date": 1}, "u": {"_id": "u1"},
+        },
+    })));
+
+    assert!(cache.room_message_ids(&room_id("r1")).is_empty());
+    assert!(cache.message(&message_id("m1")).is_none());
+    // ... and the stale `lastMessage` outlives an explicit deletion of that message, which
+    // is a real staleness the caller has to know about.
+    cache.remove_message_in(&room_id("r1"), &message_id("m1"));
+    assert!(cache.room(&room_id("r1")).expect("cached").last_message.is_some());
+}
+
+// -- 3. tombstones -----------------------------------------------------------------------
+
+/// The tombstone the server actually writes. `Messages.setAsDeletedByIdAndUser`
+/// (Messages.ts:1060-1085) `$set`s `msg: ''`, `t: 'rm'`, `urls: []`, `mentions: []`,
+/// `attachments: []`, `reactions: {}`, `editedAt`, `editedBy`, and `$unset`s `md`, `blocks`
+/// and `tshow`. Note what that means: the emptied collections *are* carried, so a merge
+/// would not resurrect them — but `md`, `blocks` and `tshow` are unset, so a merge would
+/// resurrect those. Replace is the right policy; the reason is `$unset`, not `$set`.
+fn server_tombstone(id: &str, rid: &str) -> Message {
+    message(json!({
+        "_id": id, "_updatedAt": {"$date": 9}, "rid": rid, "msg": "",
+        "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice"},
+        "t": "rm", "editedAt": {"$date": 9},
+        "editedBy": {"_id": "u2", "username": "mod"},
+        "urls": [], "mentions": [], "attachments": [], "reactions": {},
+    }))
+}
+
+#[test]
+fn the_server_shaped_tombstone_is_detected_and_strips_the_unset_fields() {
+    let cache = Cache::new();
+    assert!(server_tombstone("m1", "r1").is_deleted_tombstone());
+
+    cache.update(&message(json!({
+        "_id": "m1", "_updatedAt": {"$date": 1}, "rid": "r1", "msg": "secret",
+        "ts": {"$date": 1}, "u": {"_id": "u1", "username": "alice"},
+        "md": [{"type": "PARAGRAPH"}], "blocks": [{"type": "section"}], "tshow": true,
+        "attachments": [{"text": "secret"}],
+    })));
+
+    cache.update(&server_tombstone("m1", "r1"));
+
+    let cached = cache.message(&message_id("m1")).expect("kept");
+    assert!(cached.is_deleted_tombstone());
+    // The `$unset` trio: these are the ones a merge would have resurrected.
+    assert!(cached.md.is_none());
+    assert!(cached.blocks.is_none());
+    assert!(cached.tshow.is_none());
+    // The `$set`-to-empty group arrives empty rather than absent.
+    assert_eq!(cached.attachments.as_deref(), Some(&[][..]));
+    assert!(cached.reactions.as_ref().is_some_and(|r| r.is_empty()));
+}
+
+/// A tombstone for a message the cache never saw is stored under the default policy, and
+/// takes a slot in the room's ring. That is intentional (the document exists server-side)
+/// but it is a slot spent on a message the bot will never render, so pin it.
+#[test]
+fn a_tombstone_for_an_uncached_message_is_stored_under_the_replace_policy() {
+    let cache = Cache::new();
+
+    cache.update(&server_tombstone("m1", "r1"));
+
+    assert!(cache.message(&message_id("m1")).is_some());
+    assert_eq!(cache.room_message_ids(&room_id("r1")), vec![message_id("m1")]);
+}
+
+/// A tombstone always replaces, whatever the caller asked for, and the detection runs on
+/// the *incoming* payload. So a later ordinary update to a tombstoned message still carries
+/// `t: "rm"` (nothing on the server ever unsets `t`) and is therefore still detected as a
+/// tombstone and still replaces. The "sticky rm" a shallow merge could produce is
+/// unreachable from the server for that reason; pin it so a future change to
+/// `is_deleted_tombstone` cannot open it up quietly.
+#[test]
+fn an_update_after_a_tombstone_is_still_treated_as_a_tombstone() {
+    let cache = Cache::new();
+
+    cache.update(&plain_message("m1", "r1", "before"));
+    cache.update(&server_tombstone("m1", "r1"));
+
+    // `Messages.decreaseReplyCountById` on a tombstoned thread parent re-broadcasts the
+    // whole document, still carrying `t: "rm"`.
+    let mut again = server_tombstone("m1", "r1");
+    again.tcount = Some(0);
+    cache.update(&again);
+
+    let cached = cache.message(&message_id("m1")).expect("kept");
+    assert!(cached.is_deleted_tombstone());
+    assert_eq!(cached.msg, "");
+    assert_eq!(cached.tcount, Some(0));
+}
+
+/// Under `Evict`, a tombstone for a message cached in a *different* room than the tombstone
+/// claims removes the document but leaves the id in the other room's ring. The tombstone
+/// always carries the right `rid`, so this is unreachable from the server — but
+/// `remove_message_in` is public and the same shape is reachable through it. See the
+/// dangling-ring test below.
+#[test]
+fn evicting_a_tombstone_unlinks_from_the_rid_the_tombstone_carries() {
+    let cache = Cache::builder().tombstone_policy(TombstonePolicy::Evict).build();
+
+    cache.update(&plain_message("m1", "r1", "hi"));
+    cache.update(&server_tombstone("m1", "r1"));
+
+    assert!(cache.message(&message_id("m1")).is_none());
+    assert!(cache.room_message_ids(&room_id("r1")).is_empty());
+    assert_eq!(cache.stats().rooms_with_messages, 0, "the emptied ring was not reaped");
+}
+
+// -- 4. indices and eviction -------------------------------------------------------------
+
+/// `reindex` returns early when the name did not change, so it never repairs an index entry
+/// that a *different* room took over and then vacated. The cached room keeps its name and
+/// becomes unreachable by it, permanently.
+///
+/// BUG (reported, not fixed): repairing it needs a map lookup on every update whose name is
+/// unchanged — i.e. on the hottest write path — for a case that needs two rooms to share a
+/// name. Recorded here rather than fixed. See the review notes for the recommendation.
+#[test]
+fn a_name_index_entry_vacated_by_another_room_is_never_repaired() {
+    let cache = Cache::new();
+
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c", "name": "general",
+    })));
+    // A second room claims the same name — a rename race across two publications.
+    cache.update(&room(json!({
+        "_id": "r2", "_updatedAt": {"$date": 2}, "t": "c", "name": "general",
+    })));
+    assert_eq!(cache.room_id_by_name("general"), Some(room_id("r2")));
+
+    cache.remove_room(&room_id("r2"));
+
+    // r1 is still cached and still named "general" ...
+    assert_eq!(cache.room(&room_id("r1")).expect("cached").name.as_deref(), Some("general"));
+    // ... and no further update to it ever puts it back in the index.
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 3}, "t": "c", "name": "general", "topic": "t",
+    })));
+    assert_eq!(cache.room_id_by_name("general"), None, "current behaviour: unreachable by name");
+}
+
+/// The same hole in the username index.
+#[test]
+fn a_username_index_entry_vacated_by_another_user_is_never_repaired() {
+    let cache = Cache::new();
+
+    cache.update(&user(json!({"_id": "u1", "username": "alice"})));
+    cache.update(&user(json!({"_id": "u2", "username": "alice"})));
+    cache.remove_user(&user_id("u2"));
+
+    cache.update(&user(json!({"_id": "u1", "username": "alice", "name": "Alice"})));
+
+    assert!(cache.user(&user_id("u1")).is_some());
+    assert_eq!(cache.user_id_by_username("alice"), None, "current behaviour");
+}
+
+/// Eviction must never leave an index entry pointing at a document that is gone.
+#[test]
+fn eviction_takes_the_username_index_with_it() {
+    let cache = Cache::builder().user_cache_size(NonZeroUsize::new(2)).build();
+
+    cache.update(&user(json!({"_id": "u0", "username": "zero"})));
+    cache.update(&user(json!({"_id": "u1", "username": "one"})));
+    cache.update(&user(json!({"_id": "u2", "username": "two"})));
+
+    assert!(cache.user(&user_id("u0")).is_none());
+    assert_eq!(cache.user_id_by_username("zero"), None, "index outlived its document");
+    assert_eq!(cache.user_id_by_username("one"), Some(user_id("u1")));
+    assert_eq!(cache.user_id_by_username("two"), Some(user_id("u2")));
+    assert_eq!(cache.stats().users, 2);
+}
+
+/// A username handed from one account to another must not be dragged out of the index when
+/// the *old* account is evicted.
+#[test]
+fn eviction_does_not_steal_a_username_another_user_has_claimed() {
+    let cache = Cache::builder().user_cache_size(NonZeroUsize::new(2)).build();
+
+    cache.update(&user(json!({"_id": "u0", "username": "alice"})));
+    // u1 takes the name over (a rename the cache saw out of order).
+    cache.update(&user(json!({"_id": "u1", "username": "alice"})));
+    // A third insert evicts u0.
+    cache.update(&user(json!({"_id": "u2", "username": "carol"})));
+
+    assert!(cache.user(&user_id("u0")).is_none());
+    assert_eq!(cache.user_id_by_username("alice"), Some(user_id("u1")));
+}
+
+/// Capacity one is the degenerate case the FIFO has to survive.
+#[test]
+fn a_user_capacity_of_one_keeps_exactly_the_newest() {
+    let cache = Cache::builder().user_cache_size(NonZeroUsize::new(1)).build();
+
+    for n in 0..5 {
+        cache.update(&user(json!({"_id": format!("u{n}"), "username": format!("user{n}")})));
+        assert_eq!(cache.stats().users, 1, "capacity broken after {n} inserts");
+    }
+    assert!(cache.user(&user_id("u4")).is_some());
+}
+
+/// `remove_user` for an id the cache never held must not corrupt the queue.
+#[test]
+fn removing_an_absent_user_is_a_no_op_for_the_queue() {
+    let cache = Cache::builder().user_cache_size(NonZeroUsize::new(2)).build();
+
+    cache.update(&user(json!({"_id": "u0"})));
+    cache.remove_user(&user_id("nobody"));
+    cache.update(&user(json!({"_id": "u1"})));
+    cache.update(&user(json!({"_id": "u2"})));
+
+    assert_eq!(cache.stats().users, 2);
+    assert!(cache.user(&user_id("u0")).is_none(), "u0 should have been the eviction victim");
+    assert!(cache.user(&user_id("u1")).is_some());
+    assert!(cache.user(&user_id("u2")).is_some());
+}
+
+/// Re-inserting a user that was already evicted must give it a fresh place in the queue and
+/// not a duplicate one.
+#[test]
+fn a_re_inserted_user_gets_one_queue_slot_not_two() {
+    let cache = Cache::builder().user_cache_size(NonZeroUsize::new(2)).build();
+
+    cache.update(&user(json!({"_id": "a"})));
+    cache.update(&user(json!({"_id": "b"})));
+    cache.update(&user(json!({"_id": "c"}))); // evicts a
+    cache.update(&user(json!({"_id": "a"}))); // evicts b
+    cache.update(&user(json!({"_id": "d"}))); // must evict c, not a
+
+    assert_eq!(cache.stats().users, 2);
+    assert!(cache.user(&user_id("a")).is_some(), "a was evicted by a stale duplicate slot");
+    assert!(cache.user(&user_id("d")).is_some());
+}
+
+/// Under contention the map must stay at or below capacity: the eviction queue and the map
+/// must not drift apart. `note_new_user` reads `users.len()` outside the queue lock and
+/// drops evicted documents after releasing it, so this is the interleaving that would show
+/// a drift if one existed.
+#[test]
+fn concurrent_inserts_never_leave_the_user_map_over_capacity() {
+    use std::thread;
+
+    const CAPACITY: usize = 64;
+
+    for _round in 0..20 {
+        let cache = Arc::new(Cache::builder().user_cache_size(NonZeroUsize::new(CAPACITY)).build());
+        let mut handles = Vec::new();
+        for worker in 0..8u32 {
+            let cache = Arc::clone(&cache);
+            handles.push(thread::spawn(move || {
+                for n in 0..200u32 {
+                    let id = format!("u{}", worker * 200 + n);
+                    cache.update(&user(json!({"_id": id, "username": format!("n{id}")})));
+                    if n.is_multiple_of(7) {
+                        cache.remove_user(&UserId::new(format!("u{}", worker * 200 + n)));
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker panicked");
+        }
+
+        let stats = cache.stats();
+        assert!(stats.users <= CAPACITY, "user map drifted to {} over {CAPACITY}", stats.users);
+        // Every surviving index entry must resolve to a live document.
+        for id in cache.user_ids() {
+            let username = cache.user(&id).and_then(|u| u.username.clone());
+            if let Some(username) = username
+                && let Some(indexed) = cache.user_id_by_username(&username)
+            {
+                assert!(cache.user(&indexed).is_some(), "username index outlived its document");
+            }
+        }
+    }
+}
+
+// -- 5. deadlocks ------------------------------------------------------------------------
+
+/// Runs `body` on a worker thread and fails — rather than hanging the suite — if it has not
+/// finished within `limit`.
+fn within<F>(limit: Duration, what: &str, body: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    use std::sync::mpsc;
+    use std::thread;
+
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        body();
+        let _ = tx.send(());
+    });
+    match rx.recv_timeout(limit) {
+        Ok(()) => handle.join().expect("worker panicked"),
+        Err(_) => panic!("{what} did not finish within {limit:?}: deadlock"),
+    }
+}
+
+/// `unlink_message` holds a `get_mut` guard on `room_messages` and then, if the ring is now
+/// empty, removes the same key from the same map. If the guard were still alive the shard
+/// would deadlock against itself. This is a single-threaded hang, so it needs the timeout.
+#[test]
+fn emptying_a_rooms_ring_does_not_deadlock_the_ring_map_against_itself() {
+    within(Duration::from_secs(5), "remove_message_in on the last message", || {
+        let cache = Cache::new();
+        cache.update(&plain_message("m1", "r1", "hi"));
+        cache.remove_message_in(&room_id("r1"), &message_id("m1"));
+        assert_eq!(cache.stats().rooms_with_messages, 0);
+
+        // The same shape through the other entry point.
+        cache.update(&plain_message("m2", "r2", "hi"));
+        cache.remove_message(&message_id("m2"));
+        assert_eq!(cache.stats().rooms_with_messages, 0);
+    });
+}
+
+/// `link_message` holds the ring guard and then removes from the message map. Capacity one
+/// makes it evict on every single insert, so if the two were ever locked together this
+/// hangs immediately.
+#[test]
+fn a_capacity_one_ring_evicts_on_every_insert_without_deadlocking() {
+    within(Duration::from_secs(5), "capacity-one ring inserts", || {
+        let cache = Cache::builder().message_cache_size(1).build();
+        for n in 0..50 {
+            cache.update(&plain_message(&format!("m{n}"), "r1", "hi"));
+            assert_eq!(cache.stats().messages, 1);
+            assert_eq!(cache.room_message_ids(&room_id("r1")).len(), 1);
+        }
+        assert_eq!(cache.newest_message_id(&room_id("r1")), Some(message_id("m49")));
+    });
+}
+
+/// The crate claims no internal path holds a guard on one map while locking another. Hold a
+/// `Reference` on a room and then drive the whole write surface from another thread,
+/// touching every other map and every other key. Anything that needed a lock we are holding
+/// would hang here instead of returning.
+#[test]
+fn no_write_path_needs_a_lock_a_live_reference_is_holding() {
+    let cache = Arc::new(Cache::builder().user_cache_size(NonZeroUsize::new(4)).build());
+
+    cache.update(&room(json!({
+        "_id": "held", "_updatedAt": {"$date": 1}, "t": "c", "name": "held",
+    })));
+    cache.update(&room(json!({
+        "_id": "other", "_updatedAt": {"$date": 1}, "t": "c", "name": "other",
+    })));
+    cache.update(&plain_message("m1", "other", "hi"));
+    cache.set_current_user(user(json!({"_id": "me", "username": "bot"})));
+
+    let guard = cache.room(&room_id("held")).expect("cached");
+
+    let worker = Arc::clone(&cache);
+    within(Duration::from_secs(10), "the write surface with a Reference held", move || {
+        for n in 0..64u32 {
+            worker.update(&room(json!({
+                "_id": "other", "_updatedAt": {"$date": n}, "t": "c", "name": "other",
+            })));
+            worker.update(&user(json!({"_id": format!("u{n}"), "username": format!("n{n}")})));
+            worker.update(&subscription(json!({
+                "_id": "s1", "_updatedAt": {"$date": n}, "rid": "other", "t": "c",
+                "ts": {"$date": 1}, "u": {"_id": "me"},
+                "open": true, "unread": 0, "userMentions": 0, "groupMentions": 0,
+            })));
+            worker.update(&plain_message(&format!("m{n}"), "other", "hi"));
+            worker.remove_message_in(&RoomId::new("other"), &MessageId::new(format!("m{n}")));
+            worker.remove_user(&UserId::new(format!("u{n}")));
+            worker.set_current_user(user(json!({"_id": "me", "username": "bot"})));
+            let _ = worker.current_user();
+            let _ = worker.stats();
+            let _ = format!("{worker:?}");
+        }
+        worker.remove_room(&RoomId::new("other"));
+        worker.remove_subscription(&RoomId::new("other"));
+    });
+
+    // Still valid, still the document we asked for.
+    assert_eq!(guard.name.as_deref(), Some("held"));
+    drop(guard);
+}
+
+/// Two `Reference`s alive at once on different maps, which is the shape a caller reaches for
+/// when comparing a room against its subscription. Both are read locks, so this must be
+/// fine — but it is worth pinning, because it is the pattern one shard-write away from an
+/// ABBA hang.
+#[test]
+fn two_references_on_different_maps_can_be_alive_at_once() {
+    within(Duration::from_secs(5), "two live references", || {
+        let cache = Cache::new();
+        cache.update(&room(json!({
+            "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c", "name": "general",
+        })));
+        cache.update(&subscription(json!({
+            "_id": "s1", "_updatedAt": {"$date": 1}, "rid": "r1", "t": "c",
+            "ts": {"$date": 1}, "u": {"_id": "me"},
+            "open": true, "unread": 3, "userMentions": 0, "groupMentions": 0,
+        })));
+
+        let room_ref = cache.room(&room_id("r1")).expect("cached");
+        let sub_ref = cache.subscription(&room_id("r1")).expect("cached");
+        assert_eq!(room_ref.name.as_deref(), Some("general"));
+        assert_eq!(sub_ref.unread, 3);
+    });
+}
+
+// -- 6. the message ring -----------------------------------------------------------------
+
+/// Interleaved rooms evict independently, and each ring keeps its own arrival order.
+#[test]
+fn interleaved_rooms_evict_independently() {
+    let cache = Cache::builder().message_cache_size(2).build();
+
+    cache.update(&plain_message("a1", "ra", "hi"));
+    cache.update(&plain_message("b1", "rb", "hi"));
+    cache.update(&plain_message("a2", "ra", "hi"));
+    cache.update(&plain_message("b2", "rb", "hi"));
+    cache.update(&plain_message("a3", "ra", "hi")); // evicts a1 only
+
+    assert_eq!(cache.room_message_ids(&room_id("ra")), vec![message_id("a3"), message_id("a2")]);
+    assert_eq!(cache.room_message_ids(&room_id("rb")), vec![message_id("b2"), message_id("b1")]);
+    assert!(cache.message(&message_id("a1")).is_none());
+    assert!(cache.message(&message_id("b1")).is_some());
+    assert_eq!(cache.stats().messages, 4);
+}
+
+/// The same id delivered twice — a re-broadcast, or a `loadHistory` replay overlapping the
+/// stream — must update in place and take exactly one ring slot.
+#[test]
+fn the_same_message_id_twice_takes_one_ring_slot() {
+    let cache = Cache::builder().message_cache_size(3).build();
+
+    cache.update(&plain_message("m1", "r1", "first"));
+    cache.update(&plain_message("m1", "r1", "second"));
+    cache.update(&plain_message("m1", "r1", "third"));
+
+    assert_eq!(cache.room_message_ids(&room_id("r1")), vec![message_id("m1")]);
+    assert_eq!(cache.message(&message_id("m1")).expect("cached").msg, "third");
+    assert_eq!(cache.stats().messages, 1);
+}
+
+/// A message that fell out of the ring and comes back — someone edited an old message —
+/// re-enters at the newest end, because ordering is by arrival. Pin it: it is surprising,
+/// and `newest_message_id` is a public accessor that says "most recently arrived".
+#[test]
+fn an_edit_to_an_evicted_message_re_enters_the_ring_as_the_newest() {
+    let cache = Cache::builder().message_cache_size(2).build();
+
+    cache.update(&plain_message("m1", "r1", "old"));
+    cache.update(&plain_message("m2", "r1", "mid"));
+    cache.update(&plain_message("m3", "r1", "new")); // evicts m1
+    assert!(cache.message(&message_id("m1")).is_none());
+
+    cache.update(&plain_message("m1", "r1", "edited"));
+
+    assert_eq!(cache.newest_message_id(&room_id("r1")), Some(message_id("m1")));
+    assert_eq!(cache.room_message_ids(&room_id("r1")), vec![message_id("m1"), message_id("m3")]);
+    assert!(cache.message(&message_id("m2")).is_none(), "m2 was evicted to make room");
+}
+
+/// `remove_message_in` unlinks from the room id it was *given*, not from the one the cached
+/// document carries. Called with the wrong room it drops the document and leaves the id in
+/// the real room's ring — and the next arrival of that id then links it a second time, so
+/// the ring holds a duplicate and the eviction of one copy deletes a document the other copy
+/// still points at.
+///
+/// BUG (reported, not fixed — it needs a caller error to reach, and the fix changes the
+/// documented "works for a message that was never cached" behaviour). See the review notes.
+#[test]
+fn remove_message_in_with_the_wrong_room_leaves_a_dangling_ring_entry() {
+    let cache = Cache::new();
+
+    cache.update(&plain_message("m1", "r1", "hi"));
+    cache.remove_message_in(&room_id("WRONG"), &message_id("m1"));
+
+    // Document gone, ring entry left behind: the two now disagree.
+    assert!(cache.message(&message_id("m1")).is_none());
+    assert_eq!(cache.room_message_ids(&room_id("r1")), vec![message_id("m1")]);
+
+    // And the id is linked a second time when it comes back.
+    cache.update(&plain_message("m1", "r1", "hi again"));
+    assert_eq!(
+        cache.room_message_ids(&room_id("r1")),
+        vec![message_id("m1"), message_id("m1")],
+        "current behaviour: a duplicate ring entry",
+    );
+}
+
+/// Whatever else happens, the ring and the map must agree after ordinary use. This is the
+/// invariant the duplicate above breaks; assert it holds on every path that does not need a
+/// caller error.
+#[test]
+fn the_ring_and_the_message_map_agree_after_ordinary_use() {
+    let cache = Cache::builder().message_cache_size(4).build();
+
+    for n in 0..40u32 {
+        let rid = format!("r{}", n % 3);
+        cache.update(&plain_message(&format!("m{n}"), &rid, "hi"));
+        if n.is_multiple_of(5) {
+            cache.remove_message(&message_id(&format!("m{n}")));
+        }
+        if n.is_multiple_of(11) {
+            cache.update(&server_tombstone(&format!("m{n}"), &rid));
+        }
+    }
+
+    let mut linked = 0;
+    for n in 0..3 {
+        let ids = cache.room_message_ids(&room_id(&format!("r{n}")));
+        assert!(ids.len() <= 4);
+        for id in &ids {
+            assert!(cache.message(id).is_some(), "ring holds {id:?}, the map does not");
+        }
+        linked += ids.len();
+    }
+    assert_eq!(linked, cache.stats().messages, "the map holds messages no ring points at");
+}
+
+/// A room removed while its ring is full takes every one of its messages with it, and only
+/// its own.
+#[test]
+fn removing_a_room_leaves_other_rooms_rings_alone() {
+    let cache = Cache::builder().message_cache_size(3).build();
+
+    for n in 0..3 {
+        cache.update(&plain_message(&format!("a{n}"), "ra", "hi"));
+        cache.update(&plain_message(&format!("b{n}"), "rb", "hi"));
+    }
+
+    cache.remove_room(&room_id("ra"));
+
+    assert_eq!(cache.stats().messages, 3);
+    assert_eq!(cache.stats().rooms_with_messages, 1);
+    assert!(cache.room_message_ids(&room_id("ra")).is_empty());
+    assert_eq!(cache.room_message_ids(&room_id("rb")).len(), 3);
+}
+
+/// A zero-capacity ring stores nothing at all — including through `replace_message`, which
+/// bypasses the merge but not the gate.
+#[test]
+fn a_zero_capacity_ring_rejects_replace_too() {
+    let cache = Cache::builder().message_cache_size(0).build();
+
+    assert!(cache.replace_message(plain_message("m1", "r1", "hi")).is_none());
+    assert!(cache.message(&message_id("m1")).is_none());
+    assert_eq!(cache.stats().rooms_with_messages, 0);
+}
+
+// -- 7. the Reference contract -----------------------------------------------------------
+
+/// A `Reference` **is** `Send`, and the compiler therefore does *not* catch the guard held
+/// across an `.await` inside a `tokio::spawn`.
+///
+/// `dashmap`'s own lock guard is `!Send` (`GuardMarker = GuardNoSend`, dashmap-6.2.1
+/// `src/lock.rs:23`), but `Ref` re-adds the impl by hand:
+/// `unsafe impl<K: Eq + Hash + Sync, V: Sync> Send for Ref<'_, K, V>`
+/// (dashmap-6.2.1 `src/mapref/one.rs:13`). Every key and value this cache stores is `Sync`,
+/// so every `Reference` this cache hands out is `Send`.
+///
+/// This compiles, which is the whole point of the test. If a future `dashmap` drops that
+/// impl the line below stops compiling, and the documentation in `reference.rs` can be
+/// strengthened again — but until then it must not promise a safety net that is not there.
+#[test]
+fn a_reference_is_send_so_the_compiler_does_not_catch_the_await_hazard() {
+    fn assert_send<T: Send>() {}
+    assert_send::<Reference<'static, RoomId, Room>>();
+    assert_send::<Reference<'static, UserId, User>>();
+    assert_send::<Reference<'static, MessageId, Message>>();
+}
+
+// -- 8. the merge/replace polarity against the real wire ---------------------------------
+
+/// `replace_room` is documented for "a REST response, a `rooms/get` sync". But `rooms/get`
+/// *is* the projected payload: `roomsGetMethod` passes `{ projection: roomFields }`
+/// (apps/meteor/server/publications/room/index.ts:29), and `roomFields` does not list
+/// `uids` and has `usernames` commented out (apps/meteor/lib/publishFields.ts:56-62).
+///
+/// So following the documentation exactly — merge the stream, replace the sync — blanks
+/// fields the cache already held.
+///
+/// BUG (reported, not fixed — the fix is to re-aim the documentation, and to say which
+/// payloads really are complete).
+#[test]
+fn replacing_with_a_rooms_get_payload_drops_the_fields_that_projection_omits() {
+    let cache = Cache::new();
+
+    // A full room, e.g. from `channels.info`, which is not projected.
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c", "name": "general",
+        "uids": ["u1", "u2"], "usernames": ["alice", "bob"], "topic": "hi",
+    })));
+
+    // What `rooms/get` actually returns for the same room.
+    cache.replace_room(room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c", "name": "general", "topic": "hi",
+    })));
+
+    let cached = cache.room(&room_id("r1")).expect("cached");
+    assert!(cached.uids.is_none(), "current behaviour: the projection blanked uids");
+    assert!(cached.usernames.is_none());
+}
+
+/// The counterpart: `watch.rooms` carries the **whole** room document, not a projection.
+/// `notifyOnRoomChangedById` reads it with `Rooms.findByIds(eligibleIds)` and no projection
+/// (apps/meteor/server/lib/notifyListener.ts:65-74), and the listener forwards it verbatim
+/// to `rooms-changed` and `stream-room-data`
+/// (apps/meteor/server/modules/listeners/listeners.module.ts:335-340). Direct callers do the
+/// same: `archiveRoom` passes `Rooms.findOneById(rid)`.
+///
+/// So on the room stream an absent key really does mean "unset", and `update()` cannot see
+/// it. `Rooms.setSystemMessagesById` (packages/models/src/models/Rooms.ts:1015) and
+/// `Rooms.unsetTeamId` (Rooms.ts:445) are two `$unset`s that reach it; the announcement is
+/// pinned here because it is the one a bot is most likely to read back.
+#[test]
+fn a_cleared_field_on_the_full_room_stream_document_survives_the_merge() {
+    let cache = Cache::new();
+
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c", "name": "general",
+        "announcement": "maintenance at 5", "topic": "hi",
+    })));
+
+    // The whole document, after the announcement was cleared.
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 2}, "t": "c", "name": "general", "topic": "hi",
+    })));
+
+    assert_eq!(
+        cache.room(&room_id("r1")).expect("cached").announcement.as_deref(),
+        Some("maintenance at 5"),
+        "current behaviour: the cleared announcement is still cached",
+    );
+
+    // `replace_room` is the only escape, and it is correct here precisely because the stream
+    // payload is complete.
+    cache.replace_room(room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 3}, "t": "c", "name": "general", "topic": "hi",
+    })));
+    assert!(cache.room(&room_id("r1")).expect("cached").announcement.is_none());
 }

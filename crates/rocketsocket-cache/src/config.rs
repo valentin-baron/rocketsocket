@@ -39,10 +39,16 @@ pub enum TombstonePolicy {
     /// document that does exist and says exactly this.
     ///
     /// Note that the tombstone **replaces** rather than merges, even though every other
-    /// update merges. A tombstone carries no `attachments`, `urls`, `md`, `file` or
-    /// `reactions`, so merging would resurrect the very content the deletion stripped —
-    /// a cache that answers with the attachments of a deleted message is worse than one
-    /// that answers nothing.
+    /// update merges. `setAsDeletedByIdAndUser` does two things to the document: it `$set`s
+    /// `msg: ''`, `t: 'rm'`, `urls: []`, `mentions: []`, `attachments: []` and
+    /// `reactions: {}` — those keys arrive present-and-empty, so a merge would overwrite
+    /// them correctly — and it `$unset`s `md`, `blocks` and `tshow`, which a merge would
+    /// *not* see and would leave in place. A cache that answers with the rendered body of a
+    /// deleted message is worse than one that answers nothing, so the whole document is
+    /// replaced rather than the three keys special-cased.
+    ///
+    /// Note also what the deletion does not touch: `file` and `files` are left on the
+    /// document, so a tombstone still carries them.
     #[default]
     Replace,
     /// Drop the message from the cache and from its room's ring.

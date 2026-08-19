@@ -37,10 +37,11 @@ use core::ops::Deref;
 /// [`Cache::room_message_ids`](crate::Cache::room_message_ids)) return owned values
 /// precisely so that no guard exists to mishandle.
 ///
-/// The underlying guard is `!Send` on the current map implementation, so the mistake often
-/// fails to compile inside a `tokio::spawn`. Do not rely on that: a `!Send` future — a
-/// `spawn_local`, a `block_on`, anything driven on a `LocalSet` — compiles fine and
-/// deadlocks at runtime.
+/// **The compiler will not catch this for you.** `dashmap`'s own lock guard is `!Send`, but
+/// `Ref` re-adds the impl by hand — `unsafe impl<K: Eq + Hash + Sync, V: Sync> Send for
+/// Ref<'_, K, V>` — and every key and value this cache stores is `Sync`, so a `Reference`
+/// held across an `.await` inside a `tokio::spawn` compiles and deadlocks at runtime. There
+/// is no borrow-checker backstop here, only this paragraph.
 ///
 /// # Why this is a newtype
 ///

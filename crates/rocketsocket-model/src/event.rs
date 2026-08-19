@@ -282,7 +282,7 @@ pub mod catalog {
                 },
                 EventSpec {
                     key: KeyPattern::Any,
-                    arities: &[3],
+                    arities: &[1, 2, 3],
                     variadic: false,
                     args: "[message: IMessage, user?: IUser, room?: IRoom]",
                 },
@@ -962,6 +962,22 @@ pub struct BulkDelete {
     /// Whether only messages carrying a file are affected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files_only: Option<bool>,
+    /// The placeholder attachment that replaces each deleted file, on a files-only prune.
+    ///
+    /// Sent whenever [`files_only`](Self::files_only) is `true`:
+    /// `cleanRoomHistory.ts:60-69` broadcasts `replaceFileAttachmentsWith:
+    /// { type: 'removed-file', color, text }` alongside the ids, and a client is expected to
+    /// swap it in rather than drop the attachment. A cache that ignores it renders a pruned
+    /// upload as if it still had its file.
+    ///
+    /// Raw JSON for the same reason [`Message::attachments`] is: `MessageAttachment` is a
+    /// large discriminated union and a wrong model would reject valid payloads.
+    #[serde(
+        rename = "replaceFileAttachmentsWith",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub replace_file_attachments_with: Option<Value>,
 }
 
 /// A desktop notification pushed to one user on `notify-user` / `<uid>/notification`.
@@ -1106,7 +1122,17 @@ impl SubscriptionChange {
 }
 
 /// The reduced subscription document `streams.ts` declares for a removal.
+///
+/// `deny_unknown_fields` is load-bearing, not tidiness. Every field below is optional bar
+/// `_id`, so without it *any* object carrying an `_id` deserializes as a stub — including a
+/// **full** subscription document that failed to parse as one. The
+/// [`SubscriptionChange`] untagged enum would then quietly hand the caller a stub with
+/// `full() == None`, which reads as "this was a removal" and discards `name`, `open`,
+/// `unread`, the mention counters and the rest. Refusing the extra fields makes that case
+/// fall through to [`StreamEvent::Unknown`] with the raw document intact, which is the rule
+/// the module docs state for a required position that did not decode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubscriptionStub {
     /// Subscription id.
     #[serde(rename = "_id")]
@@ -1841,6 +1867,35 @@ mod tests {
         assert_eq!(bulk.ignore_discussion, Some(true));
     }
 
+    /// The files-only prune, taken verbatim from `cleanRoomHistory.ts:60-69`. It is the one
+    /// bulk-delete shape that carries `replaceFileAttachmentsWith`, and dropping that field
+    /// leaves a cache showing a pruned upload as if the file were still there.
+    #[test]
+    fn a_files_only_prune_keeps_the_replacement_attachment() {
+        let replacement =
+            json!({"type": "removed-file", "color": "#e0e0e0", "text": "File removed by prune"});
+        let event = StreamEvent::decode(
+            "stream-notify-room",
+            "GENERAL/deleteMessageBulk",
+            &args(&[json!({
+                "rid": "GENERAL",
+                "excludePinned": false,
+                "ignoreDiscussion": true,
+                "ts": {"$gt": {"$date": 1_700_000_000_000_i64}},
+                "users": [],
+                "ids": ["m1", "m2"],
+                "filesOnly": true,
+                "replaceFileAttachmentsWith": replacement.clone()
+            })]),
+        );
+        let StreamEvent::MessagesDeletedBulk { bulk, .. } = event else {
+            panic!("expected MessagesDeletedBulk");
+        };
+        assert_eq!(bulk.files_only, Some(true));
+        assert_eq!(bulk.replace_file_attachments_with.as_ref(), Some(&replacement));
+        assert_eq!(bulk.ids.map(|ids| ids.len()), Some(2));
+    }
+
     // -----------------------------------------------------------------------------------
     // notify-user
     // -----------------------------------------------------------------------------------
@@ -1979,6 +2034,57 @@ mod tests {
             panic!("expected SubscriptionsChanged");
         };
         assert!(matches!(*subscription, SubscriptionChange::Full(_)), "prefer the full form");
+    }
+
+    /// A full subscription document that fails to decode must not be quietly downgraded to
+    /// the reduced form.
+    ///
+    /// [`SubscriptionChange`] is `untagged`, so serde falls through to [`SubscriptionStub`]
+    /// whenever [`Subscription`] does not parse — and every stub field bar `_id` is optional.
+    /// Before `deny_unknown_fields`, one bad slot anywhere in the document produced a stub
+    /// carrying four fields out of thirty, with `full()` returning `None` — indistinguishable
+    /// from a genuine removal stub, and with `name`, `open`, `unread` and both mention
+    /// counters gone. The module's rule is the opposite: a required position that did not
+    /// decode means the whole event goes to `Unknown` with the payload intact.
+    ///
+    /// `ts` is the slot used here because it is the one `PLAN.md` §5.6 flags as the next
+    /// likely `null`: Mongo runs with `ignoreUndefined: false`, and
+    /// `Subscriptions.createWithRoomAndUser` copies `ts: room.ts` unconditionally
+    /// (`packages/models/src/models/Subscriptions.ts:1676`).
+    #[test]
+    fn a_full_subscription_that_does_not_decode_is_unknown_not_a_stub() {
+        let mut broken = subscription_doc();
+        broken["ts"] = Value::Null;
+        let event = StreamEvent::decode(
+            "stream-notify-user",
+            "uid1/subscriptions-changed",
+            &args(&[json!("updated"), broken.clone()]),
+        );
+        let StreamEvent::Unknown { args: raw, .. } = &event else {
+            panic!("a half-decoded subscription is worse than none: {event:?}");
+        };
+        assert_eq!(raw.len(), 2, "the payload is preserved verbatim");
+        assert_eq!(raw[1], broken, "including every field the stub form would have dropped");
+
+        // A required field going missing behaves the same way.
+        let mut trimmed = subscription_doc();
+        trimmed.as_object_mut().expect("object").remove("unread");
+        assert!(
+            StreamEvent::decode(
+                "stream-notify-user",
+                "uid1/subscriptions-changed",
+                &args(&[json!("updated"), trimmed]),
+            )
+            .is_unknown()
+        );
+
+        // …while the declared reduced document still decodes as a stub.
+        let stub = StreamEvent::decode(
+            "stream-notify-user",
+            "uid1/subscriptions-changed",
+            &args(&[json!("removed"), json!({"_id": "5v9NNcvVXvSFvBJ9y", "rid": "GENERAL"})]),
+        );
+        assert!(!stub.is_unknown());
     }
 
     #[test]
@@ -2202,6 +2308,58 @@ mod tests {
         assert_eq!(args, payload);
     }
 
+    /// Splitting a composite key on the first `/` is safe because ids cannot contain one, and
+    /// because the server itself splits the same way.
+    ///
+    /// - `packages/random/src/RandomGenerator.ts:10` — every generated `_id` is drawn from
+    ///   `'23456789ABCDEFGHJKLMNPQRSTWXYZabcdefghijkmnopqrstuvwxyz'`, which has no `/`.
+    /// - `notifications.module.ts:160/234/252/268/308` — the server's own `allowRead` and
+    ///   `allowWrite` hooks do `const [rid] = eventName.split('/')`. An id containing a slash
+    ///   would already break Rocket.Chat's authorization, so this crate cannot be *more*
+    ///   wrong than the server by agreeing with it.
+    ///
+    /// Everything that is not a clean `<id>/<suffix>` must land in `Unknown` carrying the key
+    /// unsplit, rather than being coerced into a typed variant with a mangled id.
+    #[test]
+    fn a_composite_key_that_is_not_id_slash_suffix_is_unknown() {
+        let payload = args(&[json!("Rocket.Cat"), json!(["user-typing"])]);
+        for key in ["a/b/user-activity", "/user-activity", "user-activity", "GENERAL/", "//"] {
+            let event = StreamEvent::decode("stream-notify-room", key, &payload);
+            let StreamEvent::Unknown { event: kept, args: raw, .. } = &event else {
+                panic!("{key:?} produced {event:?}");
+            };
+            assert_eq!(kept, key);
+            assert_eq!(raw, &payload);
+        }
+    }
+
+    /// `listeners.module.ts:152-157` emits *two* frames for one video conference:
+    ///
+    /// ```js
+    /// (notifications.notifyRoom as any)(rid, callId);   // deprecated
+    /// notifications.notifyRoom(rid, 'videoconf', callId);
+    /// ```
+    ///
+    /// The first has no declared entry at all — `streams.ts:78` shows the matching
+    /// `` `${string}/${string}` `` key commented out — so it arrives as `<rid>/<callId>` with
+    /// an **empty** `args`. Neither may be mistaken for a typed `notify-room` event, and both
+    /// must reach the caller intact.
+    #[test]
+    fn the_undeclared_videoconf_key_survives_as_unknown() {
+        let deprecated = StreamEvent::decode("stream-notify-room", "GENERAL/64ab12cd", &[]);
+        let StreamEvent::Unknown { event: key, args: raw, .. } = &deprecated else {
+            panic!("expected Unknown, got {deprecated:?}");
+        };
+        assert_eq!(key, "GENERAL/64ab12cd");
+        assert!(raw.is_empty());
+        assert!(catalog::event("notify-room", "GENERAL/64ab12cd").is_none(), "undeclared");
+
+        let payload = args(&[json!("64ab12cd")]);
+        let current = StreamEvent::decode("stream-notify-room", "GENERAL/videoconf", &payload);
+        assert!(current.is_unknown());
+        assert!(catalog::event("notify-room", "GENERAL/videoconf").is_some(), "this one is");
+    }
+
     #[test]
     fn a_known_event_with_garbage_arguments_lands_in_unknown_without_panicking() {
         let cases: [(&str, &str, Vec<Value>); 6] = [
@@ -2313,35 +2471,71 @@ mod tests {
     // Drift against the pinned catalog
     // -----------------------------------------------------------------------------------
 
-    /// Every `(stream, event key)` this module types, as a concrete key the catalog can match.
-    const TYPED: &[(&str, &str)] = &[
-        ("room-messages", "__my_messages__"),
-        ("room-messages", "GENERAL"),
-        ("notify-room", "GENERAL/user-activity"),
-        ("notify-room", "GENERAL/typing"),
-        ("notify-room", "GENERAL/deleteMessage"),
-        ("notify-room", "GENERAL/deleteMessageBulk"),
-        ("notify-user", "uid1/message"),
-        ("notify-user", "uid1/notification"),
-        ("notify-user", "uid1/rooms-changed"),
-        ("notify-user", "uid1/subscriptions-changed"),
-        ("notify-user", "uid1/userData"),
-        ("notify-user", "uid1/force_logout"),
-        ("notify-logged", "user-status"),
-        ("notify-logged", "Users:NameChanged"),
-        ("notify-logged", "roles-change"),
+    /// Every `(stream, event key)` this module types, as a concrete key the catalog can
+    /// match, paired with the pattern that key is *supposed* to resolve to.
+    ///
+    /// The pattern is not decoration. Several streams declare a catch-all key alongside their
+    /// specific ones — `room-messages` is `[{ key: '__my_messages__' }, { key: string }]`, and
+    /// `notify-room` has a commented-out `` `${string}/${string}` `` entry one uncomment away
+    /// from being another — and a catch-all matches every key there is. Asserting only that
+    /// the lookup returns *something* would therefore pass on a rename: strike
+    /// `__my_messages__` from `streams.ts` and `catalog::event("room-messages",
+    /// "__my_messages__")` still answers `Some`, because the free-form room-id entry behind it
+    /// answers for everything. Comparing the resolved pattern is what actually detects drift.
+    const TYPED: &[(&str, &str, catalog::KeyPattern)] = &[
+        ("room-messages", "__my_messages__", catalog::KeyPattern::Literal("__my_messages__")),
+        ("room-messages", "GENERAL", catalog::KeyPattern::Any),
+        ("notify-room", "GENERAL/user-activity", catalog::KeyPattern::Suffix("user-activity")),
+        ("notify-room", "GENERAL/typing", catalog::KeyPattern::Suffix("typing")),
+        ("notify-room", "GENERAL/deleteMessage", catalog::KeyPattern::Suffix("deleteMessage")),
+        (
+            "notify-room",
+            "GENERAL/deleteMessageBulk",
+            catalog::KeyPattern::Suffix("deleteMessageBulk"),
+        ),
+        ("notify-user", "uid1/message", catalog::KeyPattern::Suffix("message")),
+        ("notify-user", "uid1/notification", catalog::KeyPattern::Suffix("notification")),
+        ("notify-user", "uid1/rooms-changed", catalog::KeyPattern::Suffix("rooms-changed")),
+        (
+            "notify-user",
+            "uid1/subscriptions-changed",
+            catalog::KeyPattern::Suffix("subscriptions-changed"),
+        ),
+        ("notify-user", "uid1/userData", catalog::KeyPattern::Suffix("userData")),
+        ("notify-user", "uid1/force_logout", catalog::KeyPattern::Suffix("force_logout")),
+        ("notify-logged", "user-status", catalog::KeyPattern::Literal("user-status")),
+        ("notify-logged", "Users:NameChanged", catalog::KeyPattern::Literal("Users:NameChanged")),
+        ("notify-logged", "roles-change", catalog::KeyPattern::Literal("roles-change")),
     ];
 
     /// The point of generating the catalog: if Rocket.Chat drops or renames one of these, the
     /// build fails here instead of the bot quietly never receiving the event again.
     #[test]
     fn every_typed_event_still_exists_upstream() {
-        for (stream, key) in TYPED {
-            assert!(
-                catalog::event(stream, key).is_some(),
-                "`{stream}` / `{key}` is typed here but no longer declared in streams.ts",
+        for (stream, key, pattern) in TYPED {
+            assert_eq!(
+                catalog::event(stream, key).map(|spec| spec.key),
+                Some(*pattern),
+                "`{stream}` / `{key}` is typed here but no longer declared that way in \
+                 streams.ts",
             );
         }
+    }
+
+    /// The guard above is only worth having if it fails on a rename. `room-messages` is the
+    /// stream where that is in doubt, because a catch-all key follows the literal one.
+    #[test]
+    fn the_drift_guard_is_not_satisfied_by_a_catch_all_key() {
+        let stream = catalog::stream("room-messages").expect("declared");
+        assert!(
+            stream.event("__totally_made_up__").is_some(),
+            "the catch-all answers for any key, so `is_some()` alone proves nothing",
+        );
+        assert_ne!(
+            stream.event("__totally_made_up__").map(|spec| spec.key),
+            Some(catalog::KeyPattern::Literal("__my_messages__")),
+            "…but the resolved pattern still tells the two apart",
+        );
     }
 
     #[test]

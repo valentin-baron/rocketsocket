@@ -299,14 +299,36 @@ fn parse_args(src: &str, start: usize, end: usize) -> Result<ArgsSpec> {
                 return Err(err(src, from, "trailing text after an args tuple", text));
             }
             let mut n = 0;
+            // TypeScript lets a tuple end in optional elements — `[a: A, b?: B]` is a
+            // two-slot type that legitimately arrives with one element. Counting `b` as
+            // required would report a minimum arity the server never sends: the pinned
+            // `room-messages` room-keyed entry is `[message, user?, room?]`, while
+            // `listeners.module.ts:223` emits exactly one element.
+            let mut required = 0;
             for (ef, et) in split_top_level(src, from + 1, to - 1, &[','])? {
                 let (ef, et) = trim_range(src, ef, et);
-                if ef != et {
-                    n += 1;
+                if ef == et {
+                    continue; // trailing comma
+                }
+                if src[ef..et].starts_with("...") {
+                    // A rest element has no fixed arity at all. Nothing upstream uses one,
+                    // and counting it as a single slot would be a silent mis-read.
+                    return Err(err(
+                        src,
+                        ef,
+                        "a rest element in an args tuple is not understood",
+                        &src[ef..et],
+                    ));
+                }
+                n += 1;
+                if !is_optional_element(src, ef, et)? {
+                    required = n;
                 }
             }
-            if !arities.contains(&n) {
-                arities.push(n);
+            for arity in required..=n {
+                if !arities.contains(&arity) {
+                    arities.push(arity);
+                }
             }
         } else if text.ends_with("[]") {
             variadic = true;
@@ -325,6 +347,19 @@ fn parse_args(src: &str, start: usize, end: usize) -> Result<ArgsSpec> {
     }
     arities.sort_unstable();
     Ok(ArgsSpec { source: normalise(&src[start..end]), arities, variadic })
+}
+
+/// Whether one tuple element is declared optional — `b?: B`, or a bare `B?`.
+///
+/// Only a top-level `?` counts: the `tmid?` in `[{ until: Date; tmid?: string }]` belongs to
+/// an object member, not to the tuple.
+fn is_optional_element(src: &str, from: usize, to: usize) -> Result<bool> {
+    let label_end = match find_top_level(src, from, to, &[':'])? {
+        Some(colon) => colon,
+        None => to,
+    };
+    let (_, label_end) = trim_range(src, from, label_end);
+    Ok(src[from..label_end].ends_with('?'))
 }
 
 // -------------------------------------------------------------------------------------
@@ -428,7 +463,10 @@ fn split_top_level(
             '}' | ']' | ')' => depth -= 1,
             // `<` only opens a generic argument list when it follows a type name.
             '<' if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'>' => angle += 1,
-            '>' if angle > 0 => angle -= 1,
+            // …and the `>` of a `=>` closes nothing. Without this, the commas of a callback
+            // type inside a generic — `Foo<() => void, Bar>` — read as tuple separators and
+            // silently inflate the arity.
+            '>' if angle > 0 && prev != b'=' => angle -= 1,
             _ if depth == 0 && angle == 0 && seps.contains(&c) => {
                 parts.push((from, i));
                 from = i + 1;
@@ -461,6 +499,11 @@ fn is_quote(c: char) -> bool {
 }
 
 /// Index just past the string starting at `at`.
+///
+/// The returned index is always a `char` boundary no greater than `src.len()`, even for an
+/// unterminated string or a trailing backslash. Callers slice with it, so anything else
+/// would turn malformed input into a panic instead of the [`ParseError`] this module
+/// promises.
 fn skip_string(src: &str, at: usize) -> usize {
     let bytes = src.as_bytes();
     let quote = bytes[at];
@@ -468,7 +511,9 @@ fn skip_string(src: &str, at: usize) -> usize {
     while i < src.len() {
         let c = bytes[i];
         if c == b'\\' {
-            i += 2;
+            // Step over the escape *and* the whole character it escapes, which may be
+            // multi-byte — `i += 2` would land inside it, or past the end of the input.
+            i = next_boundary(src, i + 1);
             continue;
         }
         i += 1;
@@ -477,6 +522,18 @@ fn skip_string(src: &str, at: usize) -> usize {
         }
     }
     i
+}
+
+/// Index of the next `char` boundary strictly after `i`, clamped to `src.len()`.
+fn next_boundary(src: &str, i: usize) -> usize {
+    if i >= src.len() {
+        return src.len();
+    }
+    let mut next = i + 1;
+    while next < src.len() && !src.is_char_boundary(next) {
+        next += 1;
+    }
+    next
 }
 
 /// Reads a property name: `'quoted'`, `"quoted"` or a bare identifier.
@@ -697,6 +754,74 @@ mod tests {
         assert_eq!(error.line, 3, "line 1 is the interface header");
         assert!(error.message.contains("oops"), "{}", error.message);
         assert!(error.context.contains("oops"));
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Regressions found by adversarial review
+    // -----------------------------------------------------------------------------------
+
+    /// The contract is "return an error", not "panic". `skip_string` used to step two bytes
+    /// past a backslash unconditionally, so a trailing backslash walked the cursor past the
+    /// end of the input and `strip_comments` sliced out of range.
+    #[test]
+    fn a_malformed_string_literal_errors_instead_of_panicking() {
+        for case in ["'\\", "\"\\", "`\\", "'\\\u{e9}", "'\\\u{e9}' ", "'unterminated"] {
+            let error = parse(case).expect_err("no interface, so this must be an error");
+            assert!(!error.message.is_empty(), "{case:?}");
+        }
+        // …and the same byte sequences inside an otherwise well-formed interface: an escape
+        // is rejected by `parse_key`, but the scanner must reach that check without slicing
+        // through the middle of the `\u{e9}`.
+        let source = interface("'s': [{ key: 'a\\\u{e9}b'; args: [A] }];");
+        let error = parse(&source).expect_err("an escaped key is not a plain literal");
+        assert!(error.message.contains("plain literal"), "{}", error.message);
+    }
+
+    /// `[a: A, b?: B]` can legitimately arrive with one element. The pinned catalog has
+    /// exactly one such entry, and the emit site (`listeners.module.ts:223`, which sends
+    /// `emitWithoutBroadcast(message.rid, message)`) uses the short form.
+    #[test]
+    fn optional_tuple_elements_widen_the_arity_instead_of_being_counted_as_required() {
+        let messages = catalog().stream("room-messages").expect("declared").clone();
+        assert_eq!(messages.events[1].args.arities, vec![1, 2, 3]);
+
+        let parsed =
+            parse(&interface("'s': [{ key: 'k'; args: [a: A, b?: B, c?: C] }];")).expect("parses");
+        assert_eq!(parsed.streams[0].events[0].args.arities, vec![1, 2, 3]);
+
+        // A bare optional element with no label, and an all-optional tuple.
+        let bare = parse(&interface("'s': [{ key: 'k'; args: [A, B?] }];")).expect("parses");
+        assert_eq!(bare.streams[0].events[0].args.arities, vec![1, 2]);
+        let all = parse(&interface("'s': [{ key: 'k'; args: [A?] }];")).expect("parses");
+        assert_eq!(all.streams[0].events[0].args.arities, vec![0, 1]);
+
+        // A `?` belonging to an object member is not the tuple's.
+        let nested =
+            parse(&interface("'s': [{ key: 'k'; args: [{ until: Date; tmid?: string }] }];"))
+                .expect("parses");
+        assert_eq!(nested.streams[0].events[0].args.arities, vec![1]);
+    }
+
+    /// Silently counting a rest element as one slot is exactly the half-understood read this
+    /// module exists to avoid.
+    #[test]
+    fn a_rest_element_is_an_error_not_a_slot() {
+        parse(&interface("'s': [{ key: 'k'; args: [a: A, ...rest: B[]] }];"))
+            .expect_err("a rest element has no fixed arity");
+    }
+
+    /// The `>` of `=>` used to close the generic-argument depth counter, after which the
+    /// callback's comma read as a tuple separator and the arity came out one too high.
+    #[test]
+    fn an_arrow_type_inside_a_generic_does_not_inflate_the_arity() {
+        let parsed = parse(&interface("'s': [{ key: 'k'; args: [Foo<() => void, Bar>] }];"))
+            .expect("parses");
+        assert_eq!(parsed.streams[0].events[0].args.arities, vec![1]);
+
+        // A plain nested generic still closes normally.
+        let plain =
+            parse(&interface("'s': [{ key: 'k'; args: [Map<K, Set<V>>, X] }];")).expect("parses");
+        assert_eq!(plain.streams[0].events[0].args.arities, vec![2]);
     }
 
     #[test]
