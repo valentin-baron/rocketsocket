@@ -55,7 +55,14 @@ pub use rocketsocket_rest as rest;
 mod bot;
 
 #[cfg(all(feature = "realtime", feature = "rest"))]
+pub mod framework;
+
+#[cfg(all(feature = "realtime", feature = "rest"))]
 pub use self::bot::{Bot, BotError};
+
+/// Declares an event handler. See [`framework`] for the runtime it expands against.
+#[cfg(all(feature = "macros", feature = "realtime", feature = "rest"))]
+pub use rocketsocket_macros::event;
 
 #[cfg(feature = "rest")]
 pub use rocketsocket_rest::auth::Credentials;

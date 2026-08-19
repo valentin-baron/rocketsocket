@@ -53,6 +53,20 @@ impl Bot {
         Ok((Self { rest, realtime }, events))
     }
 
+    /// A `Bot` wired to a loopback address that is never connected to.
+    ///
+    /// For tests that need a `Context` but never perform IO. Not public API.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        let rest = RestClient::new("http://127.0.0.1:1").expect("a loopback URL is valid");
+        let config = Config::new(
+            "ws://127.0.0.1:1/websocket".to_owned(),
+            Credential::Resume("test".to_owned()),
+        );
+        let (realtime, _events) = RealtimeClient::spawn(config);
+        Self { rest, realtime }
+    }
+
     /// The REST client, for anything that changes server state.
     #[must_use]
     pub fn rest(&self) -> &RestClient {

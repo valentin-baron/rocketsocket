@@ -9,8 +9,9 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-default = ["realtime", "rest", "rustls-tls-native-roots"]
+default = ["realtime", "rest", "macros", "rustls-tls-native-roots"]
 realtime = ["dep:rocketsocket-realtime"]
+macros = ["dep:rocketsocket-macros"]
 rest = ["dep:rocketsocket-rest"]
 rustls-tls-native-roots = [
     "rocketsocket-realtime?/rustls-tls-native-roots",
@@ -24,6 +25,7 @@ native-tls = ["rocketsocket-realtime?/native-tls", "rocketsocket-rest?/native-tl
 
 [dependencies]
 rocketsocket-model.workspace = true
+rocketsocket-macros = { version = "0.0.0", path = "../rocketsocket-macros", optional = true }
 rocketsocket-realtime = { version = "0.0.0", path = "../rocketsocket-realtime", default-features = false, optional = true }
 rocketsocket-rest = { version = "0.0.0", path = "../rocketsocket-rest", default-features = false, optional = true }
 thiserror.workspace = true
@@ -34,6 +36,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 futures-util = { workspace = true, features = ["sink", "std"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+trybuild = "1"
 serde_json.workspace = true
 
 [lints]

@@ -1,0 +1,13 @@
+error: an event handler must be `async`
+ --> tests/ui/not_async.rs:6:1
+  |
+6 | fn not_async(_context: Context<()>, _event: MessageCreate) -> Result<(), Error> {
+  | ^^
+
+warning: unused imports: `Context` and `MessageCreate`
+ --> tests/ui/not_async.rs:1:31
+  |
+1 | use rocketsocket::framework::{Context, MessageCreate};
+  |                               ^^^^^^^  ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

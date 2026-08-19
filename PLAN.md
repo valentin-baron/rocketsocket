@@ -415,7 +415,12 @@ the cache and facade layers do not assume otherwise.
    `#[serde(flatten)] extra: Map<String, Value>` on `Message` and `Room`; until then,
    nothing may persist or forward a decoded document and assume fidelity.
 
-2. **Explicit `null` inside a collection is still fatal.** Mongo runs with
+2. **Explicit `null` inside a collection.** *(partly fixed)* `Reaction::usernames` and
+   `Reaction::names` now skip null holes — the adversarial review of the event layer
+   raised their severity from "wrong value in a test" to "bot silently drops a message",
+   because a `Message` that fails to decode sends its whole stream frame to
+   `StreamEvent::Unknown`, which a bot matching on the typed variant discards. The rest of
+   the list below is unchanged and still unproven. Mongo runs with
    `ignoreUndefined: false`, so `undefined` is persisted as `null` — which is how
    `Subscription::name` came to be nullable. The same mechanism could put a `null` *element*
    inside `Room::muted`/`unmuted`/`usernames`/`uids`, `Subscription::roles`/`ignored`,

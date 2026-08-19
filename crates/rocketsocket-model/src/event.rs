@@ -49,6 +49,15 @@
 //!    whole event, not a half-filled variant. A `RoomMessage` whose `message` failed to parse
 //!    would be a lie; the raw args are more useful.
 //!
+//! Two places deliberately soften rule 3, both because the alternative loses more than it
+//! saves. `<rid>/user-activity` reads an absent or `null` activity list as the **empty**
+//! list, which is this event's "stopped" signal — the slot is reachable from any peer that
+//! may type in the room (`notifications.module.ts:233` ignores the activity argument when
+//! authorizing a client publish, and `streamer.module.ts:251` relays the arguments verbatim),
+//! and a spurious "stopped" is cheaper than dropping every typing indicator. And
+//! `__my_messages__` drops an unparseable trailing element rather than the message; see
+//! [`StreamEvent::MyMessage`].
+//!
 //! # `streams.ts` is the index, `listeners.module.ts` is the truth
 //!
 //! The generated [`catalog`] is read from `packages/ddp-client/src/types/streams.ts`, which
@@ -2209,6 +2218,37 @@ mod tests {
         assert_eq!(status.status_source, None);
     }
 
+    /// The two ends of the arity range the tuple has actually shipped with.
+    ///
+    /// Longer than 8 is how Rocket.Chat has extended this event twice already, so a ninth
+    /// slot must be ignored rather than rejected. Shorter than 3 is below the floor: without
+    /// the status code there is no presence change to report, and inventing one would be a
+    /// lie, so the event goes to `Unknown` with the tuple intact.
+    #[test]
+    fn user_status_ignores_a_ninth_slot_and_refuses_a_truncated_tuple() {
+        let longer = StreamEvent::decode(
+            "stream-notify-logged",
+            "user-status",
+            &args(&[json!([
+                "uid1", "john", 1, "text", "John Doe", ["user"], "manual",
+                {"$date": 1_755_518_400_000_i64}, {"somethingNew": true}
+            ])]),
+        );
+        let StreamEvent::UserStatusChanged(status) = longer else {
+            panic!("a slot this crate has never seen must not cost the whole event");
+        };
+        assert_eq!(status.status, PresenceStatus::Online);
+        assert_eq!(status.status_source, Some(PresenceSource::Manual));
+
+        for truncated in [json!(["uid1"]), json!(["uid1", "john"]), json!([])] {
+            let payload = args(&[truncated]);
+            let event = StreamEvent::decode("stream-notify-logged", "user-status", &payload);
+            assert!(event.is_unknown(), "{event:?}");
+            let StreamEvent::Unknown { args: kept, .. } = event else { unreachable!() };
+            assert_eq!(kept, payload, "the tuple survives the fallback");
+        }
+    }
+
     #[test]
     fn a_presence_code_this_crate_does_not_know_still_decodes() {
         let event = StreamEvent::decode(
@@ -2448,6 +2488,72 @@ mod tests {
         assert!(matches!(event, StreamEvent::UserActivity { .. }));
         assert_eq!(event, StreamEvent::decode_raw(raw));
         assert_eq!(event.room().map(RoomId::as_str), Some("GENERAL"));
+    }
+
+    /// The whole `__my_messages__` path, as one wire frame.
+    ///
+    /// This is the event the framework's own example bot matches on
+    /// (`crates/rocketsocket/examples/echo.rs`), and it matches with a `let … else { continue }`
+    /// — so anything that pushes a real message to `Unknown` here is a bot that silently
+    /// ignores it. The frame is built the way `listeners.module.ts:216-221` builds it:
+    /// `changedPayload(subscriptionName, 'id', { eventName, args: [...args, allowed] })`,
+    /// with `allowed` the `{roomParticipant, roomType, roomName}` returned by the `allowEmit`
+    /// hook at `notifications.module.ts:131-135`.
+    ///
+    /// The message document carries the fields a stricter model would choke on and that a
+    /// bare `hello world` fixture does not exercise: a reaction map (whose `names` array is
+    /// grafted on at broadcast time by `notifyListener.ts:484`), a resolved mention, a URL
+    /// preview, and a file upload whose `msg` is the empty string.
+    #[test]
+    fn a_my_messages_frame_decodes_end_to_end_with_the_fields_a_live_server_attaches() {
+        let frame: protocol::ServerMessage = serde_json::from_value(json!({
+            "msg": "changed",
+            "collection": "stream-room-messages",
+            "id": "id",
+            "fields": {
+                "eventName": "__my_messages__",
+                "args": [
+                    {
+                        "_id": "7aDSXtjMA3KPLxLjt",
+                        "rid": "64ab12cdEXAMPLE",
+                        "msg": "",
+                        "ts": {"$date": 1_755_518_400_000_i64},
+                        "_updatedAt": {"$date": 1_755_518_401_000_i64},
+                        "u": {"_id": "uid1", "username": "alice", "name": "Alice"},
+                        "urls": [{"url": "https://example.com", "meta": {"pageTitle": "Example"}}],
+                        "mentions": [{"_id": "uid2", "username": "bob", "name": "Bob"}],
+                        "channels": [],
+                        "md": [],
+                        "file": {"_id": "up1", "name": "diagram.png", "type": "image/png"},
+                        "files": [{"_id": "up1", "name": "diagram.png", "type": "image/png"}],
+                        "attachments": [{"title": "diagram.png", "image_url": "/file-upload/up1"}],
+                        "reactions": {
+                            ":tada:": {"usernames": ["bob"], "names": ["Bob"]}
+                        },
+                        "groupable": false
+                    },
+                    {"roomParticipant": true, "roomType": "p", "roomName": "secret-project"}
+                ]
+            }
+        }))
+        .expect("frame decodes");
+
+        let raw = frame.as_stream_event().expect("it is a stream event");
+        assert_eq!(raw.arity(), 2, "the emit site appends `allowed` to the declared `[IMessage]`");
+
+        let StreamEvent::MyMessage { message, meta } = StreamEvent::from(raw) else {
+            panic!("a real message reaching `Unknown` is a bot that silently ignores it");
+        };
+        assert_eq!(message.msg, "", "a bare upload has no text");
+        assert_eq!(message.rid.as_str(), "64ab12cdEXAMPLE");
+        assert_eq!(message.file.as_ref().map(|f| f.id.as_str()), Some("up1"));
+        assert_eq!(
+            message.reactions.as_ref().and_then(|r| r.get(":tada:")).map(|r| r.usernames.len()),
+            Some(1),
+        );
+        assert_eq!(meta.room_participant, Some(true));
+        assert_eq!(meta.room_type, Some(RoomType::Private));
+        assert_eq!(meta.room_name.as_deref(), Some("secret-project"));
     }
 
     #[test]

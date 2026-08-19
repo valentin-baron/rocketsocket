@@ -554,6 +554,67 @@ impl UserRef {
     }
 }
 
+/// Deserializers tolerant of the `null`s Mongo leaves inside arrays.
+///
+/// Rocket.Chat runs Mongo with `ignoreUndefined: false`, so a value that was `undefined`
+/// in JavaScript is persisted as BSON `null` rather than dropped. Inside an *array* that
+/// surfaces as a null element, and a plain `Vec<String>` rejects it — which fails the
+/// whole enclosing document.
+///
+/// That failure is not cosmetic on a live path: a `Message` that will not decode makes
+/// its `stream-room-messages` frame fall through to an untyped event, and a bot matching
+/// on the typed variant then drops the message silently. Skipping the hole keeps the
+/// other participants, which is strictly more useful than losing the message.
+pub mod nullable_strings {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    /// Deserializes a required array, discarding null elements.
+    ///
+    /// # Errors
+    /// Returns an error only if the value is not an array of strings-or-nulls.
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<String>, D::Error> {
+        let raw = Vec::<Option<String>>::deserialize(deserializer)?;
+        Ok(raw.into_iter().flatten().collect())
+    }
+
+    /// Serializes the array normally.
+    ///
+    /// # Errors
+    /// Propagates any error from the underlying serializer.
+    pub fn serialize<S: Serializer>(value: &[String], serializer: S) -> Result<S::Ok, S::Error> {
+        value.serialize(serializer)
+    }
+
+    /// The same, for an optional array.
+    pub mod option {
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+        /// Deserializes an optional array, discarding null elements.
+        ///
+        /// # Errors
+        /// Returns an error only if the value is neither null nor an array.
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<Vec<String>>, D::Error> {
+            let raw = Option::<Vec<Option<String>>>::deserialize(deserializer)?;
+            Ok(raw.map(|values| values.into_iter().flatten().collect()))
+        }
+
+        /// Serializes the array normally.
+        ///
+        /// # Errors
+        /// Propagates any error from the underlying serializer.
+        pub fn serialize<S: Serializer>(
+            value: &Option<Vec<String>>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            value.serialize(serializer)
+        }
+    }
+}
+
 /// One entry of [`Message::mentions`].
 ///
 /// The `all` and `here` pseudo-mentions carry no [`MessageMention::mention_type`].
@@ -635,10 +696,12 @@ pub struct UrlHeaders {
 pub struct Reaction {
     /// Usernames of the reacting users. Usernames, not ids — renaming a user rewrites this.
     #[serde(default)]
+    #[serde(with = "crate::entity::nullable_strings")]
     pub usernames: Vec<String>,
     /// Display names of the reacting users, populated only when the server is configured to
     /// show real names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "crate::entity::nullable_strings::option")]
     pub names: Option<Vec<String>>,
     /// Matrix federation bookkeeping: username to remote event id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2652,5 +2715,37 @@ mod tests {
         assert_eq!(PresenceStatus::from(0u8), PresenceStatus::Offline);
         assert_eq!(PresenceStatus::from(0u8).as_user_status(), Some(UserStatus::Offline));
         assert!(PresenceStatus::Unknown(9).as_user_status().is_none());
+    }
+
+    #[test]
+    fn a_null_hole_in_a_reaction_does_not_lose_the_whole_message() {
+        // Mongo runs with ignoreUndefined: false, so an undefined username is persisted as
+        // a null array element. A plain Vec<String> rejects it, which fails the whole
+        // Message -- and a failed Message makes its stream frame fall through to an
+        // untyped event, which a bot matching on the typed variant then drops silently.
+        let message: Message = serde_json::from_str(
+            r#"{"_id":"m1","_updatedAt":{"$date":1},"rid":"GENERAL","msg":"hi",
+                "ts":{"$date":1},"u":{"_id":"u1","username":"alice"},
+                "reactions":{":tada:":{"usernames":["alice",null,"bob"],
+                                       "names":["Alice",null]}}}"#,
+        )
+        .expect("a null hole must not fail the message");
+
+        let reaction = message.reaction(":tada:").expect("reaction present");
+        assert_eq!(reaction.usernames, ["alice", "bob"], "the hole is skipped, the rest kept");
+        assert_eq!(reaction.names.as_deref(), Some(&["Alice".to_owned()][..]));
+        assert!(reaction.contains("bob"));
+        assert_eq!(reaction.count(), 2, "the null must not be counted as a reactor");
+    }
+
+    #[test]
+    fn an_all_null_reaction_list_decodes_as_empty() {
+        let message: Message = serde_json::from_str(
+            r#"{"_id":"m1","_updatedAt":{"$date":1},"rid":"GENERAL","msg":"hi",
+                "ts":{"$date":1},"u":{"_id":"u1","username":"alice"},
+                "reactions":{":tada:":{"usernames":[null,null]}}}"#,
+        )
+        .expect("must decode");
+        assert!(message.reaction(":tada:").expect("present").usernames.is_empty());
     }
 }

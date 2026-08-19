@@ -1,0 +1,15 @@
+error: an event handler must take a `Context<D>` or `State<D>` parameter, so the macro can name the bot's data type in the handler it returns
+ --> tests/ui/no_context.rs:5:1
+  |
+5 | #[rocketsocket::event]
+  | ^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `rocketsocket::event` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused import: `rocketsocket::framework::MessageCreate`
+ --> tests/ui/no_context.rs:1:5
+  |
+1 | use rocketsocket::framework::MessageCreate;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
