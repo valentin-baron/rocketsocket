@@ -47,11 +47,18 @@
 //!
 //! # Cost
 //!
-//! Two `serde_json::Value` round trips per update. That is not free, and it is chosen
-//! knowingly: the alternative is 72 hand-written field assignments for `Room` alone, which
-//! would silently regain the blanking bug the first time the model grows a field and someone
-//! forgets to add a line. Correctness that survives model changes is worth the allocation;
-//! if a profile ever says otherwise, this is the one function to specialize.
+//! Two `serde_json::to_value` conversions and one `from_value` per update. That is not free,
+//! and it is chosen knowingly: the alternative is 72 hand-written field assignments for
+//! `Room` alone, which would silently regain the blanking bug the first time the model grows
+//! a field and someone forgets to add a line. Correctness that survives model changes is
+//! worth the allocation; if a profile ever says otherwise, this is the one function to
+//! specialize.
+//!
+//! It used to cost more. Until the model's EJSON timestamp visitor accepted an owned map key
+//! there was no way to deserialize an entity from a [`Value`] at all — `from_value` failed
+//! with `invalid type: string "$date", expected a borrowed string` on every entity carrying
+//! a timestamp — so the merged document was rendered back to text and reparsed. That detour
+//! is gone.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -83,7 +90,7 @@ where
         merged.insert(key, value);
     }
 
-    match decode(&Value::Object(merged)) {
+    match serde_json::from_value(Value::Object(merged)) {
         Ok(value) => value,
         Err(error) => {
             tracing::warn!(
@@ -94,22 +101,6 @@ where
             incoming
         }
     }
-}
-
-/// Deserializes an entity from a [`Value`], the long way round.
-///
-/// `serde_json::from_value` would be the obvious call and it does not work: the model's
-/// EJSON timestamp visitor reads its `$date` key with `map.next_key::<&str>()`, which only
-/// a *borrowing* deserializer can satisfy. `from_value` hands out owned strings, so every
-/// entity carrying a timestamp — `Room`, `Message`, `Subscription`, and any `User` with a
-/// `_updatedAt` — fails with `invalid type: string "$date", expected a borrowed string`.
-///
-/// Rendering to text first gives the deserializer something to borrow from. It costs a
-/// string per merge and it is the reason this is a separate function rather than one call:
-/// if the model ever accepts an owned key, this is the single place to simplify.
-fn decode<T: DeserializeOwned>(value: &Value) -> Result<T, serde_json::Error> {
-    let rendered = serde_json::to_string(value)?;
-    serde_json::from_str(&rendered)
 }
 
 /// The set of top-level keys a document serializes to.
@@ -136,9 +127,8 @@ mod tests {
 
     use super::{carried_fields, is_object, merge_documents};
 
-    /// Note the `from_str`: the model cannot be deserialized from a `Value`. See [`decode`].
     fn entity<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
-        serde_json::from_str(&value.to_string()).expect("fixture")
+        serde_json::from_value(value).expect("fixture")
     }
 
     fn room(value: serde_json::Value) -> Room {

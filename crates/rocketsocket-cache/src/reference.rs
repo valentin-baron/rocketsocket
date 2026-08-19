@@ -19,6 +19,22 @@ use core::ops::Deref;
 /// else completes, and if that something else is a cache write, the two deadlock. This is
 /// the single most likely way to hang a program with this crate.
 ///
+/// Note how little it takes. The lock is on a **shard**, not on a key, so the write that
+/// deadlocks against your guard does not have to touch the entity you are holding, or even
+/// be on another thread:
+///
+/// ```ignore
+/// // ALSO WRONG, and on one thread with no await in sight: if `other` happens to hash to
+/// // the same shard as `id`, this blocks forever. Whether it does is decided by a random
+/// // hash seed chosen when the process starts, so it will work in testing and hang in
+/// // production one run in `shards`.
+/// let room = cache.room(&id).unwrap();
+/// cache.update(&some_other_room);
+/// ```
+///
+/// The rule is therefore stronger than "do not hold one across an `.await`": **do not hold
+/// one across a cache write at all**, whoever performs it.
+///
 /// ```ignore
 /// // WRONG: the guard is alive across the await, and `send_message` may take seconds.
 /// let room = cache.room(&id).unwrap();

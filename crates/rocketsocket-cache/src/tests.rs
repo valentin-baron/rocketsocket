@@ -12,11 +12,8 @@ use crate::{Cache, Reference, ResourceType, TombstonePolicy};
 
 // -- fixtures ----------------------------------------------------------------------------
 
-/// Note the `from_str`: `serde_json::from_value` cannot decode any entity carrying a
-/// timestamp, because the model's EJSON visitor reads its `$date` key with
-/// `next_key::<&str>()` and only a borrowing deserializer can supply one.
 fn entity<T: serde::de::DeserializeOwned>(value: Value) -> T {
-    serde_json::from_str(&value.to_string()).expect("fixture")
+    serde_json::from_value(value).expect("fixture")
 }
 
 fn room(value: Value) -> Room {
@@ -1357,115 +1354,217 @@ fn concurrent_inserts_never_leave_the_user_map_over_capacity() {
 
 // -- 5. deadlocks ------------------------------------------------------------------------
 
-/// Runs `body` on a worker thread and fails — rather than hanging the suite — if it has not
-/// finished within `limit`.
-fn within<F>(limit: Duration, what: &str, body: F)
+/// A progress signal from a worker under [`makes_progress`].
+struct Beat(std::sync::mpsc::Sender<()>);
+
+impl Beat {
+    /// Reports that one more unit of work finished.
+    fn tick(&self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// Runs `body` on a worker thread and fails if it ever goes `stall` without reporting a
+/// single unit of progress.
+///
+/// This is deliberately **not** a stopwatch. An earlier version of these tests gave the
+/// worker a fixed wall-clock budget for the whole body, which made them fail under parallel
+/// test load for reasons that had nothing to do with locking — a deadlock detector that
+/// fires on a busy machine is worse than no detector, because it teaches you to ignore it.
+/// A deadlocked worker stops beating; a merely descheduled one does not, however long the
+/// whole body ends up taking.
+fn makes_progress<F>(stall: Duration, what: &str, body: F)
 where
-    F: FnOnce() + Send + 'static,
+    F: FnOnce(&Beat) + Send + 'static,
 {
-    use std::sync::mpsc;
+    use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
 
     let (tx, rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        body();
-        let _ = tx.send(());
-    });
-    match rx.recv_timeout(limit) {
-        Ok(()) => handle.join().expect("worker panicked"),
-        Err(_) => panic!("{what} did not finish within {limit:?}: deadlock"),
+    let handle = thread::spawn(move || body(&Beat(tx)));
+
+    loop {
+        match rx.recv_timeout(stall) {
+            Ok(()) => {}
+            // The worker dropped its `Beat`, so it returned or panicked; `join` tells which.
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                panic!("{what} made no progress for {stall:?}: deadlock")
+            }
+        }
     }
+
+    handle.join().expect("worker panicked");
 }
 
 /// `unlink_message` holds a `get_mut` guard on `room_messages` and then, if the ring is now
 /// empty, removes the same key from the same map. If the guard were still alive the shard
-/// would deadlock against itself. This is a single-threaded hang, so it needs the timeout.
+/// would deadlock against itself — on one thread, with nothing else running.
 #[test]
 fn emptying_a_rooms_ring_does_not_deadlock_the_ring_map_against_itself() {
-    within(Duration::from_secs(5), "remove_message_in on the last message", || {
+    makes_progress(Duration::from_secs(30), "remove_message_in on the last message", |beat| {
         let cache = Cache::new();
-        cache.update(&plain_message("m1", "r1", "hi"));
-        cache.remove_message_in(&room_id("r1"), &message_id("m1"));
-        assert_eq!(cache.stats().rooms_with_messages, 0);
+        for n in 0..64 {
+            let rid = format!("r{n}");
+            cache.update(&plain_message(&format!("m{n}"), &rid, "hi"));
+            cache.remove_message_in(&room_id(&rid), &message_id(&format!("m{n}")));
+            assert_eq!(cache.stats().rooms_with_messages, 0);
+            beat.tick();
 
-        // The same shape through the other entry point.
-        cache.update(&plain_message("m2", "r2", "hi"));
-        cache.remove_message(&message_id("m2"));
-        assert_eq!(cache.stats().rooms_with_messages, 0);
+            // The same shape through the other entry point, which finds the room itself.
+            cache.update(&plain_message(&format!("x{n}"), &rid, "hi"));
+            cache.remove_message(&message_id(&format!("x{n}")));
+            assert_eq!(cache.stats().rooms_with_messages, 0);
+            beat.tick();
+        }
     });
 }
 
 /// `link_message` holds the ring guard and then removes from the message map. Capacity one
 /// makes it evict on every single insert, so if the two were ever locked together this
-/// hangs immediately.
+/// wedges on the first one.
 #[test]
 fn a_capacity_one_ring_evicts_on_every_insert_without_deadlocking() {
-    within(Duration::from_secs(5), "capacity-one ring inserts", || {
+    makes_progress(Duration::from_secs(30), "capacity-one ring inserts", |beat| {
         let cache = Cache::builder().message_cache_size(1).build();
-        for n in 0..50 {
+        for n in 0..64 {
             cache.update(&plain_message(&format!("m{n}"), "r1", "hi"));
             assert_eq!(cache.stats().messages, 1);
             assert_eq!(cache.room_message_ids(&room_id("r1")).len(), 1);
+            beat.tick();
         }
-        assert_eq!(cache.newest_message_id(&room_id("r1")), Some(message_id("m49")));
+        assert_eq!(cache.newest_message_id(&room_id("r1")), Some(message_id("m63")));
     });
 }
 
-/// The crate claims no internal path holds a guard on one map while locking another. Hold a
-/// `Reference` on a room and then drive the whole write surface from another thread,
-/// touching every other map and every other key. Anything that needed a lock we are holding
-/// would hang here instead of returning.
+/// The crate's internal claim — no path holds a guard on one map while locking another —
+/// tested the way it is actually stated: by driving the whole write surface concurrently
+/// from several threads, with **no** `Reference` held anywhere.
+///
+/// If two internal paths ever took two locks in opposite orders, the threads would wedge
+/// against each other and the heartbeat would stop. Holding an external `Reference` while
+/// doing this would prove nothing, because a `Reference` blocks same-shard writes *by
+/// design* — see [`a_live_reference_blocks_writes_to_unrelated_keys_on_its_shard`].
 #[test]
-fn no_write_path_needs_a_lock_a_live_reference_is_holding() {
-    let cache = Arc::new(Cache::builder().user_cache_size(NonZeroUsize::new(4)).build());
+fn the_write_surface_makes_progress_under_concurrency() {
+    use std::thread;
 
-    cache.update(&room(json!({
-        "_id": "held", "_updatedAt": {"$date": 1}, "t": "c", "name": "held",
-    })));
-    cache.update(&room(json!({
-        "_id": "other", "_updatedAt": {"$date": 1}, "t": "c", "name": "other",
-    })));
-    cache.update(&plain_message("m1", "other", "hi"));
-    cache.set_current_user(user(json!({"_id": "me", "username": "bot"})));
+    makes_progress(Duration::from_secs(30), "the concurrent write surface", |beat| {
+        let cache = Arc::new(Cache::builder().user_cache_size(NonZeroUsize::new(4)).build());
+        cache.set_current_user(user(json!({"_id": "me", "username": "bot"})));
+
+        thread::scope(|scope| {
+            for worker in 0..4u32 {
+                let cache = Arc::clone(&cache);
+                let beat = &beat;
+                scope.spawn(move || {
+                    for n in 0..128u32 {
+                        let rid = format!("r{}", n % 3);
+                        cache.update(&room(json!({
+                            "_id": rid, "_updatedAt": {"$date": n}, "t": "c",
+                            "name": format!("name{}", n % 3),
+                        })));
+                        cache.update(&user(json!({
+                            "_id": format!("u{n}"), "username": format!("n{n}"),
+                        })));
+                        cache.update(&subscription(json!({
+                            "_id": "s1", "_updatedAt": {"$date": n}, "rid": rid, "t": "c",
+                            "ts": {"$date": 1}, "u": {"_id": "me"},
+                            "open": true, "unread": 0, "userMentions": 0, "groupMentions": 0,
+                        })));
+                        let mid = format!("m{worker}-{n}");
+                        cache.update(&plain_message(&mid, &rid, "hi"));
+                        cache.remove_message_in(&RoomId::new(rid.clone()), &MessageId::new(mid));
+                        cache.remove_user(&UserId::new(format!("u{n}")));
+                        cache.set_current_user(user(json!({"_id": "me", "username": "bot"})));
+                        if n.is_multiple_of(16) {
+                            cache.remove_room(&RoomId::new(rid.clone()));
+                            cache.remove_subscription(&RoomId::new(rid));
+                        }
+                        let _ = cache.current_user();
+                        let _ = cache.stats();
+                        let _ = format!("{cache:?}");
+                        beat.tick();
+                    }
+                });
+            }
+        });
+    });
+}
+
+/// A live `Reference` blocks **every** write that hashes to its shard, including writes to
+/// keys that have nothing to do with it.
+///
+/// This is the sharp edge behind the crate's `.await` warning, and it is sharper than the
+/// warning says. `Reference` is a lock on a *shard*, not on a key, so "do not hold one
+/// across an `.await`" understates the rule: you must not hold one across **any** cache
+/// write, on any key, even a synchronous one on the same thread. Whether a given pair of
+/// keys collides depends on a per-process random hash seed, so the failure is a
+/// one-in-`shards` coin flip that reproduces on some runs and not others.
+///
+/// The test shows the block and then clears it: the worker cannot get past some key while
+/// the guard is alive, and finishes the moment it is dropped. Nothing here is a bug in the
+/// crate — it is a documentation gap, reported as such.
+#[test]
+fn a_live_reference_blocks_writes_to_unrelated_keys_on_its_shard() {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::thread;
+
+    // Enough distinct keys that at least one is certain to land on the held key's shard.
+    const KEYS: u32 = 512;
+
+    let cache = Arc::new(Cache::new());
+    cache.update(&room(json!({"_id": "held", "_updatedAt": {"$date": 1}, "t": "c"})));
 
     let guard = cache.room(&room_id("held")).expect("cached");
 
+    let (tx, rx) = mpsc::channel();
     let worker = Arc::clone(&cache);
-    within(Duration::from_secs(10), "the write surface with a Reference held", move || {
-        for n in 0..64u32 {
+    let handle = thread::spawn(move || {
+        for n in 0..KEYS {
             worker.update(&room(json!({
-                "_id": "other", "_updatedAt": {"$date": n}, "t": "c", "name": "other",
+                "_id": format!("k{n}"), "_updatedAt": {"$date": 2}, "t": "c",
             })));
-            worker.update(&user(json!({"_id": format!("u{n}"), "username": format!("n{n}")})));
-            worker.update(&subscription(json!({
-                "_id": "s1", "_updatedAt": {"$date": n}, "rid": "other", "t": "c",
-                "ts": {"$date": 1}, "u": {"_id": "me"},
-                "open": true, "unread": 0, "userMentions": 0, "groupMentions": 0,
-            })));
-            worker.update(&plain_message(&format!("m{n}"), "other", "hi"));
-            worker.remove_message_in(&RoomId::new("other"), &MessageId::new(format!("m{n}")));
-            worker.remove_user(&UserId::new(format!("u{n}")));
-            worker.set_current_user(user(json!({"_id": "me", "username": "bot"})));
-            let _ = worker.current_user();
-            let _ = worker.stats();
-            let _ = format!("{worker:?}");
+            if tx.send(n).is_err() {
+                return;
+            }
         }
-        worker.remove_room(&RoomId::new("other"));
-        worker.remove_subscription(&RoomId::new("other"));
     });
 
-    // Still valid, still the document we asked for.
-    assert_eq!(guard.name.as_deref(), Some("held"));
+    // Wait for the worker to stop making progress. The window is enormous compared with a
+    // single map insert, so a merely descheduled worker is not mistaken for a blocked one —
+    // and if it ever were, the test would pass vacuously rather than fail, because a false
+    // early stop still satisfies the `reached < KEYS - 1` assertion below.
+    let mut completed = 0;
+    loop {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(n) => completed = n + 1,
+            Err(RecvTimeoutError::Timeout) => break,
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("no key among {KEYS} collided with the held shard; raise KEYS")
+            }
+        }
+    }
+
+    // `completed == 0` is the strongest form of the finding, not a failure: the very first
+    // unrelated key happened to share the shard, so the writer blocked before doing anything
+    // at all. Which key blocks is decided by the process-wide hash seed and varies per run.
+    assert!(completed < KEYS, "the worker was never blocked, so no key shared the shard");
+
+    // Dropping the guard releases it, and the worker runs to completion.
     drop(guard);
+    while rx.recv_timeout(Duration::from_secs(30)).is_ok() {}
+    handle.join().expect("worker panicked");
+    assert!(cache.room(&room_id(&format!("k{}", KEYS - 1))).is_some());
 }
 
 /// Two `Reference`s alive at once on different maps, which is the shape a caller reaches for
-/// when comparing a room against its subscription. Both are read locks, so this must be
-/// fine — but it is worth pinning, because it is the pattern one shard-write away from an
-/// ABBA hang.
+/// when comparing a room against its subscription. Both are read locks on different maps, so
+/// this is fine — but it is worth pinning, because it is the pattern one shard-write away
+/// from the block above.
 #[test]
 fn two_references_on_different_maps_can_be_alive_at_once() {
-    within(Duration::from_secs(5), "two live references", || {
+    makes_progress(Duration::from_secs(30), "two live references", |beat| {
         let cache = Cache::new();
         cache.update(&room(json!({
             "_id": "r1", "_updatedAt": {"$date": 1}, "t": "c", "name": "general",
@@ -1475,6 +1574,7 @@ fn two_references_on_different_maps_can_be_alive_at_once() {
             "ts": {"$date": 1}, "u": {"_id": "me"},
             "open": true, "unread": 3, "userMentions": 0, "groupMentions": 0,
         })));
+        beat.tick();
 
         let room_ref = cache.room(&room_id("r1")).expect("cached");
         let sub_ref = cache.subscription(&room_id("r1")).expect("cached");
@@ -1716,4 +1816,203 @@ fn a_cleared_field_on_the_full_room_stream_document_survives_the_merge() {
         "_id": "r1", "_updatedAt": {"$date": 3}, "t": "c", "name": "general", "topic": "hi",
     })));
     assert!(cache.room(&room_id("r1")).expect("cached").announcement.is_none());
+}
+
+// -- 9. the merge invariant, checked against the model's source ---------------------------
+
+/// Scans Rust source for `pub name: Option<..>` field declarations and returns
+/// `(structs, optional fields, offenders)`, where an offender is an optional field whose
+/// attributes do not carry `skip_serializing_if = "Option::is_none"`.
+fn audit_optional_fields(source: &str) -> (usize, usize, Vec<String>) {
+    let mut structs = 0;
+    let mut optional_fields = 0;
+    let mut violations = Vec::new();
+
+    let mut current: Option<&str> = None;
+    let mut attributes = String::new();
+    let mut inside_attribute = false;
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+
+        if let Some(rest) = trimmed.strip_prefix("pub struct ")
+            && trimmed.ends_with('{')
+        {
+            current = rest.split_whitespace().next();
+            structs += 1;
+            attributes.clear();
+            inside_attribute = false;
+            continue;
+        }
+        let Some(name) = current else { continue };
+
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        // Attributes may wrap over several lines; accumulate until the brackets balance.
+        if inside_attribute || trimmed.starts_with("#[") {
+            attributes.push(' ');
+            attributes.push_str(trimmed);
+            let balanced = attributes.matches('(').count() >= attributes.matches(')').count();
+            inside_attribute = !(trimmed.ends_with(']') && balanced);
+            continue;
+        }
+        if trimmed == "}" {
+            current = None;
+            attributes.clear();
+            continue;
+        }
+
+        // The first `:` ends the field name; later ones belong to the type.
+        if let Some(field) = trimmed.strip_prefix("pub ")
+            && let Some((field, ty)) = field.split_once(':')
+        {
+            let ty = ty.trim().trim_end_matches(',');
+            if ty.starts_with("Option<") {
+                optional_fields += 1;
+                if !attributes.contains(r#"skip_serializing_if = "Option::is_none""#) {
+                    violations.push(format!("{name}.{field}: {ty}"));
+                }
+            }
+        }
+        attributes.clear();
+    }
+
+    (structs, optional_fields, violations)
+}
+
+/// The whole crate is sound only because **every** optional field in the model carries
+/// `#[serde(skip_serializing_if = "Option::is_none")]`. One field without it serializes to
+/// `"field": null`, which the merge treats as a value the payload carried, and every
+/// partial update silently blanks that field for every cached document.
+///
+/// Checking that by example cannot be exhaustive — a field added tomorrow is not in any
+/// fixture — so this reads the model's own source and checks every field declaration in it.
+/// If the model moves or is renamed this stops compiling, which is the correct alarm.
+///
+/// Only `Room`, `User`, `Message` and `Subscription` are actually merged; the nested types
+/// are replaced wholesale. The rule is applied to all of them anyway, because "every
+/// optional field is skipped" is a far easier invariant to keep than "every optional field
+/// on these four".
+#[test]
+fn every_optional_field_in_the_model_is_skipped_when_none() {
+    const MODEL: &str = include_str!("../../rocketsocket-model/src/entity.rs");
+
+    let (structs, optional_fields, violations) = audit_optional_fields(MODEL);
+
+    assert!(structs > 10, "the source scan found only {structs} structs; the parser is broken");
+    assert!(
+        optional_fields > 200,
+        "the source scan found only {optional_fields} optional fields; the parser is broken",
+    );
+    assert!(
+        violations.is_empty(),
+        "{} optional model field(s) do not skip serializing when None, so a partial update \
+         will blank them on every merge:\n  {}",
+        violations.len(),
+        violations.join("\n  "),
+    );
+}
+
+/// The audit above is only worth anything if it can fail. Feed it the three shapes it has to
+/// tell apart: a correctly-skipped field, a bare `Option` and an `Option` whose attribute
+/// mentions everything except the skip.
+#[test]
+fn the_optional_field_audit_detects_a_violation() {
+    let source = r#"
+pub struct Sample {
+    /// Fine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub good: Option<String>,
+    /// Fine, even wrapped over several lines.
+    #[serde(
+        rename = "_updatedAt",
+        default,
+        with = "crate::datetime::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub also_good: Option<Timestamp>,
+    /// No attribute at all.
+    pub bare: Option<String>,
+    /// Attributes, but not the one that matters.
+    #[serde(default, rename = "type")]
+    pub wrong: Option<BTreeMap<String, i64>>,
+    /// Not optional, so not the audit's business.
+    pub required: String,
+}
+"#;
+
+    let (structs, optional_fields, violations) = audit_optional_fields(source);
+
+    assert_eq!(structs, 1);
+    assert_eq!(optional_fields, 4);
+    assert_eq!(
+        violations,
+        vec!["Sample.bare: Option<String>", "Sample.wrong: Option<BTreeMap<String, i64>>"]
+    );
+}
+
+/// The merge overlays **wire** keys, so a `#[serde(rename)]` has to line up on both sides —
+/// and it does, because both sides are serializations of the same Rust type. The failure
+/// mode if it ever did not would be silent: the cached key and the incoming key would
+/// differ, both would survive, and the last one written would win at decode time.
+///
+/// Exercised on the renames that do not follow `rename_all = "camelCase"`, which are the
+/// ones a hand-written merge would get wrong: `_id`, `_updatedAt`, `avatarETag`, `type`,
+/// `__rooms`, `E2EKey` and `_hidden`.
+#[test]
+fn renamed_fields_merge_under_their_wire_names() {
+    let cache = Cache::new();
+
+    cache.update(&user(json!({
+        "_id": "u1", "username": "alice", "avatarETag": "etag1", "type": "bot",
+        "__rooms": ["r1"], "_updatedAt": {"$date": 1},
+    })));
+    // A projection carrying only one of them; the rest must survive.
+    cache.update(&user(json!({"_id": "u1", "avatarETag": "etag2"})));
+
+    let cached = cache.user(&user_id("u1")).expect("cached");
+    assert_eq!(cached.avatar_etag.as_deref(), Some("etag2"));
+    assert_eq!(cached.user_type.as_deref(), Some("bot"));
+    assert_eq!(cached.rooms.as_deref(), Some(&[RoomId::new("r1")][..]));
+    assert_eq!(cached.updated_at.map(|ts| ts.unix_millis()), Some(1));
+    drop(cached);
+
+    cache.update(&message(json!({
+        "_id": "m1", "_updatedAt": {"$date": 1}, "rid": "r1", "msg": "hi",
+        "ts": {"$date": 1}, "u": {"_id": "u1"}, "_hidden": true,
+    })));
+    cache.update(&plain_message("m1", "r1", "edited"));
+    assert_eq!(cache.message(&message_id("m1")).expect("cached").hidden, Some(true));
+
+    cache.update(&subscription(json!({
+        "_id": "s1", "_updatedAt": {"$date": 1}, "rid": "r1", "t": "c", "ts": {"$date": 1},
+        "u": {"_id": "u1"}, "open": true, "unread": 0, "userMentions": 0, "groupMentions": 0,
+        "E2EKey": "key1",
+    })));
+    cache.update(&subscription(json!({
+        "_id": "s1", "_updatedAt": {"$date": 2}, "rid": "r1", "t": "c", "ts": {"$date": 1},
+        "u": {"_id": "u1"}, "open": true, "unread": 5, "userMentions": 0, "groupMentions": 0,
+    })));
+
+    let cached = cache.subscription(&room_id("r1")).expect("cached");
+    assert_eq!(cached.unread, 5);
+    assert_eq!(cached.e2e_key.as_deref(), Some("key1"), "the renamed E2EKey was blanked");
+}
+
+/// The model uses no `#[serde(flatten)]`, which matters: a flattened subdocument would
+/// spread its keys across the top level, so the shallow merge would overwrite them
+/// individually rather than as a unit — the opposite of what it does for every other
+/// subdocument, and a silent inconsistency.
+#[test]
+fn the_model_uses_no_serde_flatten() {
+    const MODEL: &str = include_str!("../../rocketsocket-model/src/entity.rs");
+
+    let flattened: Vec<&str> =
+        MODEL.lines().map(str::trim).filter(|line| line.contains("serde(flatten)")).collect();
+
+    assert!(
+        flattened.is_empty(),
+        "the merge is shallow, but the model now flattens: {flattened:?}"
+    );
 }
