@@ -32,7 +32,7 @@ async fn serve(listener: TcpListener, observed: oneshot::Sender<Value>) {
     let mut observed = Some(observed);
 
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else { return };
+        let Ok((stream, _)) = listener.accept().await else { return };
 
         // `peek`, not `read`: consuming the bytes here would leave the websocket
         // handshake with no request to parse, and it would hang forever.
@@ -44,14 +44,9 @@ async fn serve(listener: TcpListener, observed: oneshot::Sender<Value>) {
         let request = String::from_utf8_lossy(&buffer[..read]).to_string();
 
         if request.to_ascii_lowercase().contains("upgrade: websocket") {
-            let socket = tokio_tungstenite::accept_hdr_async(
-                stream,
-                |_: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
-                    Ok(response)
-                },
-            )
-            .await;
-            let Ok(mut socket) = socket else { continue };
+            let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                continue;
+            };
 
             // connect -> connected
             let _ = socket.next().await;
