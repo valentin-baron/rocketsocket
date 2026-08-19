@@ -1,0 +1,32 @@
+[package]
+name = "rocketsocket-rest"
+description = "Rocket.Chat REST API client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["rustls-tls-native-roots"]
+# Self-hosted Rocket.Chat behind an internal CA is the common enterprise case, so the
+# default trusts the OS store. webpki-roots bakes in Mozilla's set and would reject it.
+rustls-tls-native-roots = ["reqwest/rustls", "reqwest/rustls-native-certs"]
+rustls-tls-webpki-roots = ["reqwest/rustls", "reqwest/webpki-roots"]
+native-tls = ["reqwest/native-tls"]
+
+[dependencies]
+rocketsocket-model.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "http2", "query"] }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+
+[lints]
+workspace = true
