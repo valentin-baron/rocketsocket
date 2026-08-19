@@ -13,6 +13,7 @@ use rocketsocket_model::{RoomId, UploadId};
 use crate::auth::{Authentication, Credentials, LoginData, LoginOutcome, LoginRequest, TwoFactor};
 use crate::chat::{MessageEnvelope, PostMessage, PostedMessage, SendMessage};
 use crate::error::{ApiError, RestError, truncate};
+use crate::roles::{PublicRoleHolder, PublicRolesEnvelope, RoomRoleHolder, RoomRolesEnvelope};
 use crate::upload::{ConfirmUpload, FileUpload, MediaEnvelope, UploadError, UploadedFile};
 
 /// Path appended to the workspace URL to reach the v1 API.
@@ -239,6 +240,66 @@ impl Client {
         let url = self.endpoint(&["me"])?;
         let response = self.authenticated_request(Method::GET, url).await?.send().await?;
         decode(response).await
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Roles
+    // ---------------------------------------------------------------------------------
+
+    /// `GET /api/v1/roles.getUsersInPublicRoles` — every holder of a globally-scoped
+    /// public role, workspace-wide.
+    ///
+    /// The only role source a plain bot can reach: it is `authRequired` with **no**
+    /// `permissionsRequired`, unlike `users.info` (whose `roles` field needs
+    /// `view-full-other-user-info`, default `admin` only) and `roles.getUsersInRole`
+    /// (needs `access-permissions`).
+    ///
+    /// It answers for the whole workspace in one request, so an `admin` check costs one
+    /// call however much traffic there is — which matters, because the default limiter
+    /// allows ten requests per route per minute.
+    ///
+    /// Note the server filters to roles with a **non-empty `description`**. On a stock
+    /// workspace that admits `admin` but *excludes* `bot` and `app`, which are seeded with
+    /// an empty description — so this cannot be used to identify other bots.
+    ///
+    /// # Errors
+    /// Returns [`RestError`] if the request fails or the response does not decode.
+    pub async fn users_in_public_roles(&self) -> Result<Vec<PublicRoleHolder>, RestError> {
+        let url = self.endpoint(&["roles.getUsersInPublicRoles"])?;
+        let response = self.authenticated_request(Method::GET, url).await?.send().await?;
+        let envelope: PublicRolesEnvelope = decode(response).await?;
+        if !envelope.success {
+            return Err(RestError::MissingSuccess { endpoint: "roles.getUsersInPublicRoles" });
+        }
+        Ok(envelope.users)
+    }
+
+    /// `GET /api/v1/rooms.roles?rid=…` — subscription-scoped roles within one room.
+    ///
+    /// `authRequired`, no permission required. Returns one entry per user holding a
+    /// room-scoped role; conventionally `owner`, `moderator` and `leader`, though a
+    /// workspace that defines its own subscription-scoped role with a description will see
+    /// that here too — so match the roles you mean explicitly rather than treating any
+    /// entry as authority.
+    ///
+    /// # Errors
+    /// Returns [`RestError`] if the request fails or the response does not decode. Note an
+    /// inaccessible room reports `error-invalid-user` and an unknown room
+    /// `error-invalid-room`, neither distinguishable from a permission problem — treat any
+    /// failure as "unknown", never as "no roles".
+    pub async fn room_roles(&self, room: &RoomId) -> Result<Vec<RoomRoleHolder>, RestError> {
+        let url = self.endpoint(&["rooms.roles"])?;
+        let response = self
+            .authenticated_request(Method::GET, url)
+            .await?
+            .query(&[("rid", room.as_str())])
+            .send()
+            .await?;
+        let envelope: RoomRolesEnvelope = decode(response).await?;
+        if !envelope.success {
+            return Err(RestError::MissingSuccess { endpoint: "rooms.roles" });
+        }
+        Ok(envelope.roles)
     }
 
     // ---------------------------------------------------------------------------------

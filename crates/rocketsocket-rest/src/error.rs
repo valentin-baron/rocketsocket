@@ -20,6 +20,18 @@ const BODY_SNIPPET_LIMIT: usize = 512;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RestError {
+    /// A 2xx response that did not confirm success.
+    ///
+    /// Rocket.Chat pairs failures with a non-2xx status, so this should not happen against
+    /// a real server — but a proxy or a captive portal answering 200 with an empty body
+    /// would otherwise decode into an empty result, and for a role lookup "no admins" is a
+    /// security answer rather than a missing one.
+    #[error("{endpoint} returned success = false")]
+    MissingSuccess {
+        /// The endpoint that answered.
+        endpoint: &'static str,
+    },
+
     /// The base URL could not be turned into an endpoint URL.
     ///
     /// Raised at call time rather than at construction only for endpoints that interpolate

@@ -12,7 +12,7 @@ authors.workspace = true
 default = ["realtime", "rest", "macros", "rustls-tls-native-roots"]
 realtime = ["dep:rocketsocket-realtime"]
 macros = ["dep:rocketsocket-macros"]
-rest = ["dep:rocketsocket-rest", "dep:reqwest", "dep:serde", "dep:serde_json"]
+rest = ["dep:rocketsocket-rest", "dep:serde", "dep:serde_json"]
 rustls-tls-native-roots = [
     "rocketsocket-realtime?/rustls-tls-native-roots",
     "rocketsocket-rest?/rustls-tls-native-roots",
@@ -33,12 +33,6 @@ tracing.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-# The role filters need two endpoints `rocketsocket-rest` does not expose yet
-# (`roles.getUsersInPublicRoles`, `rooms.roles`), and its own `reqwest::Client` is private,
-# so this crate issues them itself. No TLS feature is selected here on purpose: Cargo
-# unifies features per crate, so the backend the `rustls-*`/`native-tls` features turn on in
-# `rocketsocket-rest` is the one this client gets too.
-reqwest = { version = "0.13", default-features = false, features = ["json"], optional = true }
 
 [dev-dependencies]
 # `io-util` and `time` are for the scripted HTTP server in tests/authority.rs; they would

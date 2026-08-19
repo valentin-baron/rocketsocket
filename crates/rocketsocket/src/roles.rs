@@ -143,15 +143,6 @@ const ADMIN_ROLE: &str = "admin";
 /// report a room role this list does not cover unless an admin defined a custom one.
 const ROOM_ADMIN_ROLES: [&str; 3] = ["owner", "moderator", "leader"];
 
-/// `X-User-Id`, lowercase for the same reason as in `rocketsocket-rest`: HTTP/2 requires it
-/// and HTTP/1.1 does not care.
-const HEADER_USER_ID: &str = "x-user-id";
-/// `X-Auth-Token`.
-const HEADER_AUTH_TOKEN: &str = "x-auth-token";
-
-/// How much of an unusable response body is kept in the log line.
-const SNIPPET_LIMIT: usize = 256;
-
 /// How long a resolved role answer is trusted, and how patient a lookup is.
 ///
 /// See the [module docs](self) for why the defaults are what they are. Every field is a
@@ -334,14 +325,9 @@ impl Lookup<'_> {
 /// See the [module docs](self) for the endpoints, the cache design and the TTL rationale.
 #[derive(Debug)]
 pub struct RoleDirectory {
-    /// Read for its base URL and its credentials. Not used to issue the request: the
-    /// endpoints below are not part of `rocketsocket-rest`'s surface yet, and its
-    /// `reqwest::Client` is private.
+    /// The bot's REST client. Role lookups share its connection pool and credentials
+    /// rather than opening a second one.
     rest: RestClient,
-    /// `Err` when the HTTP client could not be built — a TLS backend that fails to
-    /// initialise. Kept rather than propagated so that constructing a `Framework` stays
-    /// infallible; every lookup then fails closed with the reason.
-    http: Result<reqwest::Client, String>,
     config: RoleCacheConfig,
     global: SyncMutex<Slot>,
     rooms: SyncMutex<HashMap<RoomId, RoomSlot>>,
@@ -351,15 +337,8 @@ impl RoleDirectory {
     /// A directory that resolves roles through `rest`.
     #[must_use]
     pub fn new(rest: RestClient, config: RoleCacheConfig) -> Self {
-        let http = reqwest::Client::builder().build().map_err(|error| {
-            let reason = error.to_string();
-            tracing::error!(%reason, "no HTTP client for role lookups; role filters will reject");
-            reason
-        });
-
         Self {
             rest,
-            http,
             config,
             global: SyncMutex::new(empty_slot()),
             rooms: SyncMutex::new(HashMap::new()),
@@ -554,58 +533,32 @@ impl RoleDirectory {
     // ---------------------------------------------------------------------------------
 
     /// Issues one lookup and reduces it to the set of users holding the role.
+    ///
+    /// Both endpoints go through [`RestClient`], so they share its connection pool,
+    /// credentials, TLS backend and error handling. An earlier version built its own
+    /// `reqwest::Client`, which meant a second pool and a second copy of the envelope
+    /// validation.
     async fn fetch(&self, lookup: Lookup<'_>) -> Result<HashSet<UserId>, RoleLookupError> {
-        let http =
-            self.http.as_ref().map_err(|reason| RoleLookupError::Unusable(reason.clone()))?;
-        let auth = self.rest.authentication().await.ok_or(RoleLookupError::NotAuthenticated)?;
-
-        let mut url = self.rest.api_base().clone();
-        {
-            let mut path = url.path_segments_mut().map_err(|()| {
-                RoleLookupError::Unusable("the API base URL cannot have path segments".to_owned())
-            })?;
-            path.pop_if_empty().push(lookup.endpoint());
-        }
-        if let Lookup::Room(room) = lookup {
-            // `rooms.roles` validates its query with `additionalProperties: false`, so `rid`
-            // is the only parameter that may be sent.
-            url.query_pairs_mut().append_pair("rid", room.as_str());
-        }
-
-        let response = http
-            .get(url)
-            .header(HEADER_USER_ID, auth.user_id().as_str())
-            .header(HEADER_AUTH_TOKEN, auth.token().expose())
-            .send()
-            .await
-            .map_err(|error| RoleLookupError::Transport(error.to_string()))?;
-
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| RoleLookupError::Transport(error.to_string()))?;
-
-        if !status.is_success() {
-            return Err(RoleLookupError::Refused { status: status.as_u16(), body: snippet(&body) });
-        }
-
         match lookup {
             Lookup::Global => {
-                let envelope: PublicRolesEnvelope = parse(&body)?;
-                envelope.check(&body)?;
-                Ok(envelope
-                    .users
+                let holders = self
+                    .rest
+                    .users_in_public_roles()
+                    .await
+                    .map_err(|error| RoleLookupError::Transport(error.to_string()))?;
+                Ok(holders
                     .into_iter()
                     .filter(|user| holds(&user.roles, &[ADMIN_ROLE]))
                     .map(|user| user.id)
                     .collect())
             }
-            Lookup::Room(_) => {
-                let envelope: RoomRolesEnvelope = parse(&body)?;
-                envelope.check(&body)?;
-                Ok(envelope
-                    .roles
+            Lookup::Room(room) => {
+                let holders = self
+                    .rest
+                    .room_roles(room)
+                    .await
+                    .map_err(|error| RoleLookupError::Transport(error.to_string()))?;
+                Ok(holders
                     .into_iter()
                     .filter(|entry| holds(&entry.roles, &ROOM_ADMIN_ROLES))
                     .map(|entry| entry.u.id)
@@ -629,80 +582,16 @@ fn lock<T>(mutex: &SyncMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, RoleLookupError> {
-    serde_json::from_slice(body).map_err(|error| {
-        RoleLookupError::Decode(format!("{error} in {body}", body = snippet(body)))
-    })
-}
-
-/// The start of a body, for a log line, cut on a character boundary.
-fn snippet(body: &[u8]) -> String {
-    let text = String::from_utf8_lossy(body);
-    match text.char_indices().nth(SNIPPET_LIMIT) {
-        Some((cut, _)) => format!("{}…", &text[..cut]),
-        None => text.into_owned(),
-    }
-}
-
-/// `roles.getUsersInPublicRoles`.
-#[derive(Debug, serde::Deserialize)]
-struct PublicRolesEnvelope {
-    #[serde(default)]
-    success: Option<bool>,
-    #[serde(default)]
-    users: Vec<PublicRoleUser>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PublicRoleUser {
-    #[serde(rename = "_id")]
-    id: UserId,
-    #[serde(default)]
-    roles: Vec<RoleId>,
-}
-
-/// `rooms.roles`.
-#[derive(Debug, serde::Deserialize)]
-struct RoomRolesEnvelope {
-    #[serde(default)]
-    success: Option<bool>,
-    #[serde(default)]
-    roles: Vec<RoomRoleEntry>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct RoomRoleEntry {
-    u: rocketsocket_model::entity::UserRef,
-    #[serde(default)]
-    roles: Vec<RoleId>,
-}
-
-/// Both envelopes demand an explicit `success: true`.
-///
-/// `API.v1.success` always sets it, and every refusal sets it to `false`. Requiring it means
-/// a truncated body, a proxy's error page that happens to be JSON, or a `success: false`
-/// carrying no payload all become [`RoleLookupError::Refused`] rather than an empty set that
-/// silently reads as "nobody holds this role".
-macro_rules! impl_check {
-    ($envelope:ty) => {
-        impl $envelope {
-            fn check(&self, body: &[u8]) -> Result<(), RoleLookupError> {
-                if self.success == Some(true) {
-                    Ok(())
-                } else {
-                    Err(RoleLookupError::Refused { status: 200, body: snippet(body) })
-                }
-            }
-        }
-    };
-}
-
-impl_check!(PublicRolesEnvelope);
-impl_check!(RoomRolesEnvelope);
+// The response envelopes and their `success: true` validation now live in
+// `rocketsocket-rest` (`roles.rs`, `Client::users_in_public_roles`, `Client::room_roles`),
+// so there is one connection pool, one set of credentials and one copy of the check.
+// Requiring `success` explicitly still matters: a truncated body or a proxy's JSON error
+// page would otherwise decode as an empty set and read as "nobody holds this role".
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rocketsocket_rest::roles::PublicRoleHolder;
 
     fn config() -> RoleCacheConfig {
         RoleCacheConfig::DEFAULT
@@ -772,64 +661,34 @@ mod tests {
         assert!(!holds(&[], &ROOM_ADMIN_ROLES));
     }
 
-    #[test]
-    fn a_missing_success_flag_is_a_refusal_not_an_empty_answer() {
-        // `{"users": []}` and `{"success": false, "error": ".."}` must not both read as
-        // "this workspace has no admins".
-        let body = br#"{"users":[]}"#;
-        let envelope: PublicRolesEnvelope = parse(body).expect("valid json");
-        assert!(matches!(envelope.check(body), Err(RoleLookupError::Refused { status: 200, .. })));
-    }
+    // The envelope-decoding tests that were here moved to `rocketsocket-rest`, alongside
+    // the envelopes themselves. The property they pin -- that a body without an explicit
+    // `success: true` is a refusal rather than an empty answer -- is unchanged.
 
     #[test]
-    fn an_explicit_failure_envelope_is_a_refusal() {
-        let body = br#"{"success":false,"error":"unauthorized"}"#;
-        let envelope: RoomRolesEnvelope = parse(body).expect("valid json");
-        assert!(matches!(envelope.check(body), Err(RoleLookupError::Refused { .. })));
-    }
-
-    #[test]
-    fn a_room_roles_body_decodes_the_documented_shape() {
-        let body = br#"{"success":true,"roles":[
-            {"rid":"GENERAL","u":{"_id":"u1","username":"alice"},"roles":["owner"]},
-            {"rid":"GENERAL","u":{"_id":"u2","username":"bob"},"roles":["archivist"]}
-        ]}"#;
-        let envelope: RoomRolesEnvelope = parse(body).expect("the documented shape must decode");
-        envelope.check(body).expect("success: true");
-
-        let owners: Vec<_> = envelope
-            .roles
-            .into_iter()
-            .filter(|entry| holds(&entry.roles, &ROOM_ADMIN_ROLES))
-            .map(|entry| entry.u.id)
-            .collect();
-        assert_eq!(owners, vec![UserId::new("u1")]);
-    }
-
-    #[test]
-    fn a_public_roles_body_keeps_only_admins() {
+    fn only_admin_holders_are_extracted_from_the_public_roles_answer() {
         // The endpoint reports every public role, not just `admin` -- livechat-agent and
-        // livechat-manager are seeded with descriptions too.
-        let body = br#"{"success":true,"users":[
-            {"_id":"u1","username":"alice","roles":["admin","user"]},
-            {"_id":"u2","username":"bob","roles":["livechat-agent"]}
-        ]}"#;
-        let envelope: PublicRolesEnvelope = parse(body).expect("the documented shape must decode");
-        let admins: Vec<_> = envelope
-            .users
+        // livechat-manager are seeded with descriptions too, so filtering is required
+        // rather than optional.
+        let holders = vec![
+            PublicRoleHolder {
+                id: UserId::new("u1"),
+                username: Some("alice".to_owned()),
+                roles: vec![RoleId::new("admin"), RoleId::new("user")],
+            },
+            PublicRoleHolder {
+                id: UserId::new("u2"),
+                username: Some("bob".to_owned()),
+                roles: vec![RoleId::new("livechat-agent")],
+            },
+        ];
+
+        let admins: Vec<_> = holders
             .into_iter()
             .filter(|user| holds(&user.roles, &[ADMIN_ROLE]))
             .map(|user| user.id)
             .collect();
         assert_eq!(admins, vec![UserId::new("u1")]);
-    }
-
-    #[test]
-    fn a_snippet_is_cut_on_a_character_boundary() {
-        let body = "é".repeat(SNIPPET_LIMIT * 2);
-        let cut = snippet(body.as_bytes());
-        assert!(cut.ends_with('…'));
-        assert_eq!(cut.chars().count(), SNIPPET_LIMIT + 1);
     }
 
     fn directory(config: RoleCacheConfig) -> RoleDirectory {

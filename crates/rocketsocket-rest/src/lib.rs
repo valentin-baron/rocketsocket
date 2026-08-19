@@ -64,6 +64,7 @@ pub mod chat;
 pub mod client;
 pub mod error;
 pub mod pagination;
+pub mod roles;
 pub mod upload;
 
 pub use self::auth::{
