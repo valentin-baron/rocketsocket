@@ -12,7 +12,7 @@ authors.workspace = true
 default = ["realtime", "rest", "macros", "rustls-tls-native-roots"]
 realtime = ["dep:rocketsocket-realtime"]
 macros = ["dep:rocketsocket-macros"]
-rest = ["dep:rocketsocket-rest"]
+rest = ["dep:rocketsocket-rest", "dep:reqwest", "dep:serde", "dep:serde_json"]
 rustls-tls-native-roots = [
     "rocketsocket-realtime?/rustls-tls-native-roots",
     "rocketsocket-rest?/rustls-tls-native-roots",
@@ -30,14 +30,26 @@ rocketsocket-realtime = { version = "0.0.0", path = "../rocketsocket-realtime", 
 rocketsocket-rest = { version = "0.0.0", path = "../rocketsocket-rest", default-features = false, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "time"] }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+# The role filters need two endpoints `rocketsocket-rest` does not expose yet
+# (`roles.getUsersInPublicRoles`, `rooms.roles`), and its own `reqwest::Client` is private,
+# so this crate issues them itself. No TLS feature is selected here on purpose: Cargo
+# unifies features per crate, so the backend the `rustls-*`/`native-tls` features turn on in
+# `rocketsocket-rest` is the one this client gets too.
+reqwest = { version = "0.13", default-features = false, features = ["json"], optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+# `io-util` and `time` are for the scripted HTTP server in tests/authority.rs; they would
+# otherwise arrive only by feature unification with another crate in the graph.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
 futures-util = { workspace = true, features = ["sink", "std"] }
 tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
+# Also a normal dependency behind `rest`; named here so the tests do not depend on a
+# feature being on.
 serde_json.workspace = true
 
 [lints]

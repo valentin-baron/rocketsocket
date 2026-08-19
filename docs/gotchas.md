@@ -93,6 +93,76 @@ legitimately contain null holes. Decode leniently or your bot breaks on upgrade.
 
 ---
 
+## Roles
+
+### A bot cannot read another user's global roles from `users.info`
+
+`users.info` projects through `getFullUserData`, which puts `roles` in `fullFields` — applied
+only when the caller **is** that user or holds `view-full-other-user-info`. That permission
+defaults to `['admin']` alone, so a correctly provisioned `bot`-role account gets a user
+document with **no `roles` key at all**. Not an empty array: absent.
+
+Code that reads `user.roles ?? []` therefore concludes "this admin holds no roles" and, if it
+is a permission check, admits or denies on nothing.
+
+Use **`GET /api/v1/roles.getUsersInPublicRoles`** instead. It is `authRequired` with no
+permission requirement, and returns `{users: [{_id, username, roles}], success: true}` for
+every user holding a role with `scope: 'Users'` and a non-empty `description` — which on a
+stock workspace is `admin`, `livechat-agent` and `livechat-manager`. One call answers "who
+are the admins" for the whole workspace.
+
+`roles.getUsersInRole` is not an alternative: it requires `access-permissions`.
+
+### The `bot` role is invisible to that endpoint, on purpose
+
+`upsertPermissions` seeds `bot`, `app`, `user`, `guest` and `anonymous` with
+`description: ''`, and both role-listing paths filter on `description: {$exists: true, $ne:
+''}`. So there is **no endpoint a non-admin bot can call to learn that another account is a
+bot**, and `IUser.type == 'bot'` is only ever set for the built-in `rocket.cat` and for
+users created by an App — never for an ordinary account carrying the `bot` role.
+
+Combined with `IMessage.bot` being deprecated and unset, "is this message from another bot"
+is not answerable. Break bot-to-bot loops with a command prefix or a mention requirement.
+
+### Room roles: `GET /api/v1/rooms.roles?rid=<rid>`
+
+Returns `{roles: [{rid, u: {_id, username}, roles: [...]}], success: true}` — one entry per
+user holding a subscription-scoped role in that room, from `getRoomRoles(rid)`. `rid` is the
+only query parameter the schema allows (`additionalProperties: false`).
+
+Two failure modes both surface as `error-invalid-user`, from `executeGetRoomRoles`: the bot
+cannot access the room, and — separately — an unknown room gives `error-invalid-room`.
+Neither is distinguishable from a permission problem, so treat both as "unknown".
+
+The same `description` filter applies, so the roles it can report are `owner`, `moderator`
+and `leader` plus any custom subscription-scoped role the workspace defined. Match on the
+three you mean; do not treat "has any room role" as "is a room admin".
+
+### `roles-change` is suppressed by a *display* setting
+
+`stream-notify-logged` / `roles-change` is the live signal for role changes, and every
+emitter wraps it:
+
+```js
+if (settings.get('UI_DisplayRoles')) {
+    void api.broadcast('user.roleUpdate', event);
+}
+```
+
+`addUserToRole`, `removeUserFromRole`, `addRoomModerator`, `removeRoomOwner`,
+`roles.addUserToRole` — all of them. Turn off a cosmetic setting and a security-relevant
+event silently stops being emitted.
+
+It is also not emitted when someone simply loses their subscription to a room, which removes
+their room role just as effectively. Treat the event as an optimisation over a TTL, never as
+the mechanism.
+
+(Rocket.Chat's own `useRoomRolesQuery` has the `added` and `removed` scope guards inverted —
+`if (!scope || !u) return` versus `if (!!scope || !u) return` — so its client drops
+room-scoped role *removals* on the floor. Another reason not to build on the event alone.)
+
+---
+
 ## Sending
 
 ### Typing indicators fail silently if you send the wrong name

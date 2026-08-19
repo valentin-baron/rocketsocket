@@ -54,9 +54,15 @@ pub use rocketsocket_rest as rest;
 #[cfg(all(feature = "realtime", feature = "rest"))]
 mod bot;
 
+// The handler layer is built on both transports: a `Context` holds a [`Bot`], and the role
+// filters resolve over REST. Gated as one unit rather than per item, so a partial feature
+// set produces "no such module" rather than a page of errors from inside it.
 #[cfg(all(feature = "realtime", feature = "rest"))]
 pub mod filter;
+#[cfg(all(feature = "realtime", feature = "rest"))]
 pub mod framework;
+#[cfg(all(feature = "realtime", feature = "rest"))]
+pub mod roles;
 
 #[cfg(all(feature = "realtime", feature = "rest"))]
 pub use self::bot::{Bot, BotError};

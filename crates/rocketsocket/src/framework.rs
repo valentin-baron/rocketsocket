@@ -188,17 +188,66 @@ pub struct Framework<D> {
     /// Every message event needs it for the self-filter, and it never changes for the life
     /// of the connection, so fetching it per event would be a REST round trip per message.
     me: tokio::sync::OnceCell<Option<rocketsocket_model::UserId>>,
+    /// Resolves the role filters, and memoises the answers.
+    roles: crate::roles::RoleDirectory,
 }
 
 impl<D: Send + Sync + 'static> Framework<D> {
     /// Builds a framework over a bot and its state.
     #[must_use]
     pub fn new(bot: crate::Bot, data: D) -> Self {
+        let roles = crate::roles::RoleDirectory::new(
+            bot.rest().clone(),
+            crate::roles::RoleCacheConfig::DEFAULT,
+        );
+
         Self {
             handlers: Vec::new(),
             context: Context::new(bot, Arc::new(data)),
             me: tokio::sync::OnceCell::new(),
+            roles,
         }
+    }
+
+    /// Replaces the role cache settings.
+    ///
+    /// The defaults trade a five-minute staleness bound against Rocket.Chat's default
+    /// limiter of ten requests per minute per route; see [`crate::roles`] for the reasoning
+    /// and for what to change if your workspace sits at either extreme. Any answer cached
+    /// so far is discarded.
+    #[must_use]
+    pub fn role_cache(mut self, config: crate::roles::RoleCacheConfig) -> Self {
+        self.roles = crate::roles::RoleDirectory::new(self.context.bot().rest().clone(), config);
+        self
+    }
+
+    /// The role directory backing the [`Authority`](crate::filter::Authority) filters.
+    ///
+    /// Exposed so a handler can ask the same question its filter asked — the answer is
+    /// already cached — and so a bot that learns about a role change by some other route
+    /// can invalidate the snapshot.
+    #[must_use]
+    pub fn roles(&self) -> &crate::roles::RoleDirectory {
+        &self.roles
+    }
+
+    /// Subscribes to `stream-notify-logged` / `roles-change`.
+    ///
+    /// Optional, and strictly an improvement: with it, a granted or revoked role drops the
+    /// affected snapshot as soon as the event arrives instead of waiting out
+    /// [`RoleCacheConfig::ttl`](crate::roles::RoleCacheConfig::ttl). Without it — or when
+    /// the workspace has `UI_DisplayRoles` off, which suppresses the event server-side —
+    /// the TTL alone bounds staleness. [`dispatch`](Self::dispatch) applies the events; this
+    /// only asks for them.
+    ///
+    /// # Errors
+    /// Returns [`CallError`](rocketsocket_realtime::correlate::CallError) if the server
+    /// refuses the subscription or the connection ends first.
+    pub async fn watch_role_changes(
+        &self,
+    ) -> Result<(), rocketsocket_realtime::correlate::CallError> {
+        self.context.bot().realtime().subscribe("notify-logged", "roles-change").await?;
+        Ok(())
     }
 
     /// Registers a handler.
@@ -243,6 +292,8 @@ impl<D: Send + Sync + 'static> Framework<D> {
     /// clone and a task for every listener whether or not it wants the event. A caller who
     /// wants concurrency can spawn around this.
     pub async fn dispatch(&self, event: &ClientEvent) {
+        self.observe(event);
+
         for handler in &self.handlers {
             // Filters run before extraction, and before the handler body. A handler that
             // never sees its own events cannot loop, whatever its body does.
@@ -285,21 +336,34 @@ impl<D: Send + Sync + 'static> Framework<D> {
 
     /// Applies the role requirement, which needs the server.
     ///
-    /// Left unimplemented for now: `Authority::Anyone` is the default and needs no lookup,
-    /// and the role-backed variants are being built against `users.info` and `rooms.roles`
-    /// with memoisation, since a naive implementation is a REST call per message and the
-    /// default limiter allows ten per minute per route.
+    /// Delegates to the [`RoleDirectory`](crate::roles::RoleDirectory), which memoises the
+    /// answers — a lookup per message would exhaust Rocket.Chat's default limiter of ten
+    /// requests per minute per route within seconds — and fails closed on anything it
+    /// cannot establish.
     async fn authority_verdict(
         &self,
         filters: &crate::filter::Filters,
-        _message: &rocketsocket_model::entity::Message,
-        _room: &rocketsocket_model::RoomId,
+        message: &rocketsocket_model::entity::Message,
+        room: &rocketsocket_model::RoomId,
     ) -> Option<crate::filter::Filtered> {
-        match filters.authority {
-            crate::filter::Authority::Anyone => None,
-            // Fail closed: a requirement we cannot yet evaluate must reject, never admit.
-            // Admitting would silently hand an unprivileged user an admin-only handler.
-            _ => Some(crate::filter::Filtered::Authority),
+        self.roles.verdict(filters.authority, &message.u.id, room).await
+    }
+
+    /// Keeps the role cache honest about events passing through.
+    ///
+    /// Cheap and synchronous: everything here is a map operation, and the common case is
+    /// one enum comparison that matches nothing.
+    fn observe(&self, event: &ClientEvent) {
+        match event {
+            ClientEvent::Stream { event: StreamEvent::RolesChanged(change), .. } => {
+                self.roles.apply_role_change(change);
+            }
+            // A reconnect replays subscriptions but never the events missed while the socket
+            // was down, so any grant cached across the gap is unverified. Dropping the
+            // snapshots costs one lookup and closes the window in which a role revoked
+            // during an outage keeps passing.
+            ClientEvent::Resubscribed { .. } => self.roles.invalidate_all(),
+            _ => {}
         }
     }
 }

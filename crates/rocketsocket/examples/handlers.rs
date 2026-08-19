@@ -50,6 +50,33 @@ async fn ping(context: Context<Data>, event: MessageCreate) -> Result<(), Error>
     Ok(())
 }
 
+/// A role-gated handler. The author must hold the global `admin` role, and the check runs
+/// before the body — so the body never has to remember it.
+///
+/// The lookup behind it is memoised per workspace, not per message: Rocket.Chat's default
+/// limiter allows ten requests per minute per route, and a role check per message would
+/// exhaust that immediately. It also **fails closed** — if the lookup errors or times out
+/// the handler stays quiet rather than running for someone who might not be an admin.
+#[rocketsocket::event(prefix = "!shutdown", admin)]
+async fn shutdown(context: Context<Data>, event: MessageCreate) -> Result<(), Error> {
+    context
+        .bot()
+        .rest()
+        .send_message(&SendMessage::new(event.message.rid.clone()).text("acknowledged"))
+        .await?;
+    Ok(())
+}
+
+/// The same, scoped to the room the message arrived in: the author must be its owner,
+/// moderator or leader. A workspace admin who is not one of those does *not* pass — use
+/// `any_admin` for "either".
+#[rocketsocket::event(prefix = "!purge", room_admin)]
+async fn purge(context: Context<Data>, event: MessageCreate) -> Result<(), Error> {
+    tracing::info!(room = %event.message.rid, "purge requested by a room admin");
+    let _ = context;
+    Ok(())
+}
+
 /// A third, for a different event, declaring only what it needs.
 #[rocketsocket::event]
 async fn note_deletions(event: MessageDeleted, State(data): State<Data>) -> Result<(), Error> {
@@ -72,7 +99,17 @@ async fn main() -> Result<(), Error> {
     let framework = Framework::new(bot, Data { echoed: AtomicU64::new(0) })
         .handler(echo())
         .handler(ping())
+        .handler(shutdown())
+        .handler(purge())
         .handler(note_deletions());
+
+    // Optional, and strictly an improvement: a granted or revoked role then takes effect as
+    // soon as the event arrives instead of waiting out the role cache's TTL. `dispatch`
+    // applies the events; this only asks for them. Not fatal if it fails — the TTL still
+    // bounds how long a stale grant survives.
+    if let Err(error) = framework.watch_role_changes().await {
+        tracing::warn!(%error, "role changes will be picked up by TTL only");
+    }
 
     // A bot with no handlers connects, logs in and does nothing — which looks exactly like
     // a quiet server. Fail loudly instead.

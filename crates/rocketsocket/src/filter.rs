@@ -9,7 +9,9 @@
 //!
 //! 1. **There is no trustworthy "this is a bot" flag.** `IMessage.bot` is deprecated, is
 //!    never set for bot-role users, and is only populated by the integrations subsystem —
-//!    so the obvious guard does not work. Comparing `u._id` is the only reliable test.
+//!    so the obvious guard does not work. Comparing `u._id` is the only reliable test, and
+//!    it only answers *"is this me"*, never *"is this some other bot"* — see
+//!    [`Filters::allow_bots`](Filters::allow_bots()), which is a no-op for that reason.
 //! 2. **Any mutation re-broadcasts the whole message.** Reactions, pins, thread-count
 //!    bumps and link-preview enrichment all resend the full document, none of them
 //!    touching a field that says "this is not new". A handler that replies to every
@@ -53,8 +55,10 @@ pub struct Filters {
     pub allow_system: bool,
     /// See edits and the re-broadcasts caused by reactions, pins and thread bumps.
     pub allow_edits: bool,
-    /// See messages from other bot accounts. Off by default: two bots that answer each
-    /// other loop just as readily as one that answers itself.
+    /// **Currently a no-op**, in either position: Rocket.Chat gives a bot account no way to
+    /// find out whether another account is a bot. See
+    /// [`Filters::allow_bots`](Self::allow_bots()) for the endpoints that were ruled out and
+    /// why the flag was not implemented as a partial guess.
     pub allow_bots: bool,
     /// Require the message text to start with this.
     pub prefix: Option<&'static str>,
@@ -76,7 +80,8 @@ pub enum Filtered {
     SystemMessage,
     /// An edit or a re-broadcast.
     Edit,
-    /// Another bot's message.
+    /// Another bot's message. **Never produced** — see
+    /// [`Filters::allow_bots`](Filters::allow_bots()) for why that filter is a no-op.
     Bot,
     /// The text did not start with the required prefix.
     Prefix,
@@ -128,7 +133,52 @@ impl Filters {
         self
     }
 
-    /// Sees messages from other bot accounts.
+    /// **A documented no-op.** Kept so `#[event(allow_bots)]` still compiles and so the
+    /// intent stays expressible, but it changes nothing today.
+    ///
+    /// # Why this is not implemented
+    ///
+    /// The only durable definition of "another bot" on Rocket.Chat is *holds the `bot` or
+    /// `app` role*, and a bot account cannot read that. Every route was checked against the
+    /// v8.8.0-develop server:
+    ///
+    /// - **`IMessage.bot`** is `@deprecated`, never set for bot-role users, and written only
+    ///   by the integrations subsystem.
+    /// - **`IUser.type == 'bot'`** is set in exactly two places: the built-in `rocket.cat`
+    ///   account (`initialData.ts`) and users created *by an App*. An ordinary account with
+    ///   the `bot` role — which is how essentially every external bot is provisioned — has
+    ///   `type: 'user'`.
+    /// - **`users.info`** projects `roles` only through `getFullUserData`'s `fullFields`,
+    ///   applied when the caller is the user or holds `view-full-other-user-info` — which
+    ///   defaults to `['admin']`. A bot-role account gets a document with no `roles` key.
+    /// - **`roles.getUsersInRole`** requires `access-permissions`, also admin-only.
+    /// - **`roles.getUsersInPublicRoles`**, the endpoint
+    ///   [`Authority::Admin`] uses, filters on roles with a
+    ///   non-empty `description`. `bot` and `app` are seeded with `description: ''`
+    ///   (`upsertPermissions.ts`), so they are precisely the roles it omits.
+    ///
+    /// # Why it is a no-op rather than a partial guess
+    ///
+    /// The safety direction is inverted from the role filters. [`Authority`] is an
+    /// *allow*-list, so "cannot establish" means reject and the cost of not knowing is a
+    /// quiet handler. `allow_bots` is a *block*-list that is off by default, so "cannot
+    /// establish" would mean rejecting every author whose bot-ness is unknown — which, on a
+    /// correctly provisioned bot account, is everybody. The filter would silence the bot
+    /// entirely.
+    ///
+    /// The other option — treating `type: 'bot'` as the answer — would block `rocket.cat`
+    /// and App users, miss every role-provisioned bot, and cost a `users.info` call per
+    /// distinct author to do it. A guard that catches the rare case and misses the common
+    /// one, while claiming to catch both, is worse than no guard: it is the reason someone
+    /// stops adding a `prefix`.
+    ///
+    /// # What to use instead
+    ///
+    /// A bot-to-bot loop needs two handlers that answer each other's *output*. Break it the
+    /// same way you would break any other: [`prefix`](Self::prefix) or
+    /// [`mentions_me`](Self::mentions_me), so the bot only answers text addressed to it and
+    /// its own replies do not qualify. [`allow_self`](Self::allow_self) already covers the
+    /// single-bot loop, which is the one that actually happens.
     #[must_use]
     pub const fn allow_bots(mut self, yes: bool) -> Self {
         self.allow_bots = yes;
@@ -166,7 +216,10 @@ impl Filters {
     /// Applies the filters that need no network access.
     ///
     /// Returns the reason the event was rejected, or `None` if it passes. Authority checks
-    /// are not applied here — they need the server, and live in the framework.
+    /// are not applied here — they need the server, and live in
+    /// [`RoleDirectory`](crate::roles::RoleDirectory).
+    /// [`allow_bots`](Self::allow_bots()) is not applied anywhere: it is a no-op, for the
+    /// reasons recorded on it.
     #[must_use]
     pub fn local_verdict(
         &self,
@@ -326,6 +379,39 @@ mod tests {
             "mentions": [{"_id": "me", "username": "bot", "type": "user"}]
         }));
         assert_eq!(filters.local_verdict(&mentioning, &RoomId::new("GENERAL"), Some(&me())), None);
+    }
+
+    #[test]
+    fn allow_bots_is_a_no_op_in_both_positions() {
+        // Locked down deliberately. Rocket.Chat gives a bot no way to recognise another
+        // bot -- see `Filters::allow_bots` -- and because the flag blocks rather than
+        // allows, failing closed on "cannot establish" would reject every author on a
+        // correctly provisioned account. So it does nothing, and this test is here so that
+        // "fixing" it has to be a deliberate change to a stated decision rather than an
+        // accident.
+        let ordinary = message(serde_json::json!({}));
+        let room = RoomId::new("GENERAL");
+
+        for allow_bots in [false, true] {
+            let filters = Filters { allow_bots, ..Filters::default() };
+            assert_eq!(filters.local_verdict(&ordinary, &room, Some(&me())), None);
+        }
+    }
+
+    #[test]
+    fn the_bot_field_on_a_message_is_ignored() {
+        // A message from an integration does carry `bot`, and it is the one shape where the
+        // deprecated field is populated. Acting on it would make the filter work for
+        // integrations and silently not for every other bot, which is the worst of both.
+        let filters = Filters::default();
+        let from_integration = message(serde_json::json!({
+            "bot": {"i": "integration-id"},
+            "u": {"_id": "other-bot", "username": "jenkins"}
+        }));
+        assert_eq!(
+            filters.local_verdict(&from_integration, &RoomId::new("GENERAL"), Some(&me())),
+            None
+        );
     }
 
     #[test]

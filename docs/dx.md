@@ -337,6 +337,7 @@ configuration rather than the permissive one:
 #[rocketsocket::event(mentions_me, room = "GENERAL")]
 #[rocketsocket::event(admin)]                       // author must be a server admin
 #[rocketsocket::event(room_admin)]                  // owner/moderator/leader in that room
+#[rocketsocket::event(any_admin)]                   // either of the two
 #[rocketsocket::event(allow_self, allow_edits)]     // opt *in* to the dangerous behaviour
 ```
 
@@ -348,6 +349,22 @@ Filters run **before** extraction and before the handler body, so a handler that
 itself cannot loop whatever its body does. Role filters **fail closed**: a lookup that
 errors or times out rejects. Admitting on failure would silently hand an unprivileged user
 an admin-only handler; rejecting merely makes the handler quiet.
+
+The role filters are the only ones that need the server, so they are also the only ones with
+a request budget. They resolve through `roles.getUsersInPublicRoles` (one workspace-wide
+answer for `admin`) and `rooms.roles?rid=` (one answer per room), memoised behind a
+five-minute TTL with single-flight per key, negative caching of failures, and immediate
+invalidation on `stream-notify-logged`/`roles-change`. Rocket.Chat's default limiter is 10
+requests per 60 s per route per IP, so a lookup per message is not an option — see
+`crates/rocketsocket/src/roles.rs` for the full reasoning, and `docs/gotchas.md` §Roles for
+the endpoint traps.
+
+`allow_bots` is **a documented no-op**. A bot account cannot discover that another account
+is a bot: `IMessage.bot` is dead, `IUser.type` is only `bot` for `rocket.cat` and App users,
+and every endpoint that would expose the `bot` role needs an admin permission. Unlike the
+role filters, this one blocks rather than allows — so failing closed on "cannot establish"
+would reject every author and silence the bot. Use `prefix` or `mentions_me` to break
+bot-to-bot loops.
 
 ## 8. Errors
 
