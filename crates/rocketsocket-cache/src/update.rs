@@ -46,8 +46,20 @@ pub trait UpdateCache {
 }
 
 impl UpdateCache for Room {
+    /// Replaces rather than merges.
+    ///
+    /// The stream sends **complete** room documents: `notifyOnRoomChangedById` reads
+    /// `Rooms.findByIds(ids)` with no projection and broadcasts the result verbatim
+    /// (`server/lib/notifyListener.ts:63-74`). Merging a complete document is not merely
+    /// redundant — it makes an *unset* field unobservable, because a cleared value and a
+    /// projected-away value both arrive as absence. `Rooms.unsetTeamId` and
+    /// `setSystemMessagesById` both `$unset`, so a merged cache keeps a `teamId` the room
+    /// no longer has.
+    ///
+    /// The projected payloads (`roomFields`, from the `rooms/get` method) are the ones
+    /// that need merging — use [`Cache::merge_room`] for those.
     fn update(&self, cache: &Cache) {
-        cache.store_room(self.clone(), StoreMode::Merge);
+        cache.store_room(self.clone(), StoreMode::Replace);
     }
 }
 
@@ -61,6 +73,13 @@ impl UpdateCache for User {
 }
 
 impl UpdateCache for Subscription {
+    /// Merges, unlike [`Room`] and [`Message`].
+    ///
+    /// Subscriptions are the one entity that genuinely arrives projected:
+    /// `notifyOnSubscriptionChanged` sends `subscriptionFields`
+    /// (`server/lib/notifyListener.ts:510`), which omits `teamMain`, `teamId`,
+    /// `broadcast`, `encrypted` and `userHighlights`. Replacing would blank whatever a
+    /// wider read had already established.
     fn update(&self, cache: &Cache) {
         cache.store_subscription(self.clone(), StoreMode::Merge);
     }
@@ -76,8 +95,15 @@ impl UpdateCache for Message {
     /// worse than a miss, since a miss at least routes to the server. It would also churn
     /// the user eviction queue once per message. Cache the author yourself if you want it,
     /// from a real `users.info`.
+    /// Replaces rather than merges, for the same reason as [`Room`].
+    ///
+    /// `getMessageToBroadcast` reads `Messages.findOneById(id)` with no projection
+    /// (`server/lib/notifyListener.ts:442-443`), so a message arrives whole. And removing
+    /// the last reaction runs `delete message.reactions` plus `Messages.unsetReactions`
+    /// (`app/reactions/server/setReaction.ts:54-56`), which a merge cannot see: the cache
+    /// would keep showing a reaction nobody holds.
     fn update(&self, cache: &Cache) {
-        cache.store_message(self.clone(), StoreMode::Merge);
+        cache.store_message(self.clone(), StoreMode::Replace);
     }
 }
 

@@ -181,13 +181,40 @@ impl Cache {
 
     /// Stores a room as the whole truth, dropping cached fields it does not carry.
     ///
-    /// Use this for a complete document — a REST response, a `rooms/get` sync — where a
-    /// field the payload omits genuinely means the server has unset it. Use
-    /// [`Cache::update`] for stream frames, which are projected.
+    /// This is what [`Cache::update`] already does for a [`Room`], because stream frames
+    /// carry **complete** documents — `notifyOnRoomChangedById` reads `Rooms.findByIds`
+    /// with no projection. Reach for this directly only when you have a complete document
+    /// from somewhere else.
     ///
     /// Returns the previous document.
     pub fn replace_room(&self, room: Room) -> Option<Room> {
         self.store_room(room, StoreMode::Replace)
+    }
+
+    /// Merges a **projected** room into the cached one, keeping fields the payload omits.
+    ///
+    /// For payloads that are genuinely partial — chiefly `roomFields`, the projection the
+    /// `rooms/get` method applies (`apps/meteor/lib/publishFields.ts`), which omits `uids`
+    /// and `usernames`. Replacing one of those would blank whatever a stream frame had
+    /// already established.
+    ///
+    /// The trade-off is unavoidable: a merge cannot observe an *unset*, because a cleared
+    /// field and a projected-away field both arrive as absence. Prefer
+    /// [`replace_room`](Self::replace_room) whenever the source is complete.
+    ///
+    /// Returns the previous document.
+    pub fn merge_room(&self, room: Room) -> Option<Room> {
+        self.store_room(room, StoreMode::Merge)
+    }
+
+    /// Merges a **projected** message into the cached one.
+    ///
+    /// Rarely correct: `getMessageToBroadcast` sends whole documents, so
+    /// [`Cache::update`] replaces. Use this only for a source you know is partial.
+    ///
+    /// Returns the previous document.
+    pub fn merge_message(&self, message: Message) -> Option<Message> {
+        self.store_message(message, StoreMode::Merge)
     }
 
     /// Removes a room, its name index entry, its subscription, and every message cached
