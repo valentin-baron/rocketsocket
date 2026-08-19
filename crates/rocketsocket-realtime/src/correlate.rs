@@ -151,6 +151,18 @@ impl Correlator {
         }
     }
 
+    /// Forgets one pending call without delivering anything.
+    ///
+    /// For the case where the caller went away before its request reached the wire — it is
+    /// waiting on nothing, so there is nobody to hand an error to, and resolving the entry
+    /// with a synthetic value would misreport a result that never came. Left pending, it
+    /// would instead linger until the next disconnect and be counted as abandoned.
+    ///
+    /// Returns whether an entry was removed.
+    pub fn cancel(&mut self, id: &str) -> bool {
+        self.pending.remove(id).is_some()
+    }
+
     /// Ends the current connection: settles every waiter and starts a new epoch.
     ///
     /// Returns how many calls were abandoned. Nothing may be left pending — a caller
@@ -286,5 +298,25 @@ mod tests {
 
         assert_eq!(correlator.resolve(&id, Err(error.clone())), Resolution::Delivered);
         assert_eq!(receiver.blocking_recv().unwrap().unwrap_err(), CallError::Server(error));
+    }
+
+    #[test]
+    fn cancel_forgets_an_entry_without_inventing_a_result() {
+        // A caller that vanished before its frame was written is waiting on nothing.
+        // Resolving it with a synthetic value would claim a result the server never sent,
+        // and leaving it pending would miscount it as abandoned at the next disconnect.
+        let mut correlator = Correlator::new("m");
+        let (id, receiver) = correlator.register();
+        drop(receiver);
+
+        assert!(correlator.cancel(&id));
+        assert_eq!(correlator.pending(), 0);
+        assert_eq!(correlator.disconnect(), 0, "a cancelled call must not count as abandoned");
+    }
+
+    #[test]
+    fn cancelling_an_unknown_id_is_reported_not_fatal() {
+        let mut correlator = Correlator::new("m");
+        assert!(!correlator.cancel("nope"));
     }
 }

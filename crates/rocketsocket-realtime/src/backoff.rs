@@ -42,6 +42,10 @@ impl Backoff {
     }
 
     /// How many failures have accumulated since the last [`reset`](Self::reset).
+    ///
+    /// Counts calls to [`next_delay`](Self::next_delay), which increments *before*
+    /// returning — so immediately after scheduling the first retry this reads `1`, not `0`.
+    /// A caller reporting "attempt N" to a user wants `attempt().saturating_sub(1)`.
     #[must_use]
     pub fn attempt(&self) -> u32 {
         self.attempt

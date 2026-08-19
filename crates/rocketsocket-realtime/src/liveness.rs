@@ -97,6 +97,11 @@ impl LivenessPolicy {
     }
 
     /// When the next poll could change the answer, so a runner can sleep until then.
+    ///
+    /// Returns `now` when the connection is already past the threshold, rather than a time
+    /// in the past. A runner must therefore re-arm its timer from this after **every**
+    /// poll — treating the value as a stable deadline and sleeping on it repeatedly would
+    /// spin once the connection goes overdue.
     #[must_use]
     pub fn next_deadline(&self, now: Instant) -> Instant {
         let target =
