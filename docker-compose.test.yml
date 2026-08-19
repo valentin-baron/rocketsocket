@@ -1,0 +1,49 @@
+# A disposable Rocket.Chat for integration testing.
+#
+#   docker compose -f docker-compose.test.yml up -d
+#   # wait for http://localhost:3000 to answer, create an admin, mint a PAT, then:
+#   ROCKETSOCKET_URL=http://localhost:3000 \
+#   ROCKETSOCKET_USER_ID=<id> ROCKETSOCKET_TOKEN=<pat> \
+#     cargo test --workspace -- --ignored
+#
+# Pinned rather than :latest so a failing run is reproducible. 7.x is the crate's baseline;
+# bump to exercise 8.x, which is where the deprecations in PLAN.md §1 start biting.
+services:
+  mongo:
+    image: mongo:6.0
+    command: mongod --replSet rs0 --oplogSize 128 --bind_ip_all
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      retries: 20
+
+  mongo-init:
+    image: mongo:6.0
+    depends_on:
+      mongo:
+        condition: service_healthy
+    command: >
+      mongosh mongo/rocketchat --eval
+      "rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]})"
+    restart: on-failure
+
+  rocketchat:
+    image: registry.rocket.chat/rocketchat/rocket.chat:7.4.0
+    depends_on:
+      - mongo-init
+    environment:
+      MONGO_URL: mongodb://mongo:27017/rocketchat?replicaSet=rs0
+      MONGO_OPLOG_URL: mongodb://mongo:27017/local?replicaSet=rs0
+      ROOT_URL: http://localhost:3000
+      PORT: "3000"
+      # Registration open so the harness can create its own admin unattended.
+      ADMIN_USERNAME: admin
+      ADMIN_PASS: admin1234
+      ADMIN_EMAIL: admin@example.com
+      OVERWRITE_SETTING_Show_Setup_Wizard: completed
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/info"]
+      interval: 10s
+      retries: 30
