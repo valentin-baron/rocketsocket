@@ -5,6 +5,7 @@
 //! for reasons recorded in the repository's `PLAN.md` §1.
 
 pub mod backoff;
+pub mod client;
 pub mod connection;
 pub mod correlate;
 pub mod liveness;
@@ -12,6 +13,7 @@ pub mod session;
 pub mod subscription;
 
 pub use self::backoff::Backoff;
+pub use self::client::{Client, ClientEvent, ClientEvents};
 pub use self::correlate::{CallError, Correlator, Epoch, Resolution};
 pub use self::liveness::{Liveness, LivenessPolicy};
 pub use self::session::{Action, Fatal, Phase, Session};

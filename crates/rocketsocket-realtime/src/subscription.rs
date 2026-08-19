@@ -157,8 +157,11 @@ impl Registry {
 
     /// Everything to re-send after logging back in, as `(id, key, params)`.
     ///
-    /// Ids are reused: the server has no memory of the previous connection, so the old ids
-    /// are free, and keeping them stable means routing state elsewhere stays valid.
+    /// The returned id is the *old* one, and is only useful for calling
+    /// [`rekey`](Self::rekey) once the replay has been issued. The replay itself must
+    /// allocate a **fresh** id: a `sub` re-using an id the client still has outstanding is
+    /// silently dropped by the server — no `ready`, no `nosub` — so recycling ids would
+    /// leave the caller waiting on an acknowledgement that never comes.
     #[must_use]
     pub fn to_replay(&self) -> Vec<(String, StreamKey, Vec<Value>)> {
         let mut replay: Vec<_> = self
@@ -176,6 +179,29 @@ impl Registry {
         for entry in self.by_id.values_mut() {
             entry.state = SubState::Pending;
         }
+    }
+
+    /// Moves a remembered subscription onto the id its replay was issued under.
+    ///
+    /// Returns whether `old` was known. The entry keeps its stream key and params, so
+    /// routing is unaffected; only the wire id changes.
+    pub fn rekey(&mut self, old: &str, new: impl Into<String>) -> bool {
+        let Some(mut entry) = self.by_id.remove(old) else {
+            return false;
+        };
+        let new = new.into();
+
+        if let Entry::Occupied(mut occupied) = self.by_key.entry(entry.key.clone()) {
+            for id in occupied.get_mut() {
+                if id == old {
+                    id.clone_from(&new);
+                }
+            }
+        }
+
+        entry.state = SubState::Pending;
+        self.by_id.insert(new, entry);
+        true
     }
 
     /// The subscription ids interested in an incoming event.
@@ -313,5 +339,41 @@ mod tests {
         let registry = Registry::new();
         assert!(registry.is_empty());
         assert!(registry.to_replay().is_empty());
+    }
+
+    #[test]
+    fn rekey_moves_a_subscription_onto_its_replay_id_without_disturbing_routing() {
+        // A replay must use a fresh id -- the server silently drops a `sub` re-using an
+        // outstanding one -- so the registry has to follow the id, not fix it.
+        let mut registry = Registry::new();
+        registry.insert("s0", key("room-messages", "GENERAL"), vec![json!("GENERAL")]);
+        registry.mark_ready("s0");
+        registry.connection_lost();
+
+        assert!(registry.rekey("s0", "s7"));
+
+        assert_eq!(registry.state("s0"), None);
+        assert_eq!(registry.state("s7"), Some(SubState::Pending));
+        assert_eq!(registry.subscribers(&key("room-messages", "GENERAL")), ["s7"]);
+        assert_eq!(registry.to_replay()[0].2, vec![json!("GENERAL")], "params must survive");
+    }
+
+    #[test]
+    fn rekey_only_moves_the_entry_it_names() {
+        let mut registry = Registry::new();
+        registry.insert("s0", key("notify-room", "GENERAL/typing"), vec![]);
+        registry.insert("s1", key("notify-room", "GENERAL/typing"), vec![]);
+
+        registry.rekey("s0", "s9");
+
+        let mut subscribers = registry.subscribers(&key("notify-room", "GENERAL/typing")).to_vec();
+        subscribers.sort();
+        assert_eq!(subscribers, ["s1", "s9"]);
+    }
+
+    #[test]
+    fn rekeying_an_unknown_id_is_reported_not_fatal() {
+        let mut registry = Registry::new();
+        assert!(!registry.rekey("nope", "s1"));
     }
 }
