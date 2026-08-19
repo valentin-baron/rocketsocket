@@ -1,0 +1,13 @@
+error: unknown filter `only_admins`; expected one of allow_self, allow_system, allow_edits, allow_bots, mentions_me, prefix = "..", room = "..", admin, room_admin, any_admin
+ --> tests/ui/unknown_filter.rs:5:23
+  |
+5 | #[rocketsocket::event(only_admins)]
+  |                       ^^^^^^^^^^^
+
+warning: unused imports: `Context` and `MessageCreate`
+ --> tests/ui/unknown_filter.rs:1:31
+  |
+1 | use rocketsocket::framework::{Context, MessageCreate};
+  |                               ^^^^^^^  ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

@@ -30,6 +30,7 @@ rocketsocket-realtime = { version = "0.0.0", path = "../rocketsocket-realtime", 
 rocketsocket-rest = { version = "0.0.0", path = "../rocketsocket-rest", default-features = false, optional = true }
 thiserror.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

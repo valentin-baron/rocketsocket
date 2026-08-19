@@ -67,6 +67,15 @@ impl Bot {
         Self { rest, realtime }
     }
 
+    /// The bot's own user id, once authenticated.
+    ///
+    /// Needed by the loop-safety filters: Rocket.Chat has no per-message "is a bot" flag
+    /// worth trusting (`IMessage.bot` is deprecated and never set for bot-role users), so
+    /// comparing `u._id` is the only reliable way for a bot to recognise its own traffic.
+    pub async fn user_id(&self) -> Option<rocketsocket_model::UserId> {
+        self.rest.authentication().await.map(|auth| auth.user_id().clone())
+    }
+
     /// The REST client, for anything that changes server state.
     #[must_use]
     pub fn rest(&self) -> &RestClient {

@@ -37,25 +37,127 @@ use syn::{FnArg, ItemFn, PatType, ReturnType, Type, parse_macro_input};
 /// handler declares only what it needs.
 #[proc_macro_attribute]
 pub fn event(args: TokenStream, input: TokenStream) -> TokenStream {
-    if !args.is_empty() {
-        let span = proc_macro2::TokenStream::from(args).span();
-        return syn::Error::new(
-            span,
-            "`#[event]` takes no arguments; the event is identified by the handler's \
-             parameter type",
-        )
-        .to_compile_error()
-        .into();
-    }
+    let filters = match parse_filters(args) {
+        Ok(filters) => filters,
+        Err(error) => return error.to_compile_error().into(),
+    };
 
     let function = parse_macro_input!(input as ItemFn);
-    match expand(function) {
+    match expand(function, filters) {
         Ok(tokens) => tokens.into(),
         Err(error) => error.to_compile_error().into(),
     }
 }
 
-fn expand(function: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
+/// The filter arguments, as written.
+#[derive(Default)]
+struct Filters {
+    allow_self: bool,
+    allow_system: bool,
+    allow_edits: bool,
+    allow_bots: bool,
+    mentions_me: bool,
+    prefix: Option<syn::LitStr>,
+    room: Option<syn::LitStr>,
+    authority: Option<proc_macro2::TokenStream>,
+}
+
+/// Parses `#[event(allow_self, prefix = "!", admin)]`.
+///
+/// Every flag is named for what it *allows*, so the absence of arguments is the safe
+/// configuration rather than the permissive one.
+fn parse_filters(args: TokenStream) -> syn::Result<Filters> {
+    let mut filters = Filters::default();
+    if args.is_empty() {
+        return Ok(filters);
+    }
+
+    let parser = syn::meta::parser(|meta| {
+        let path = meta.path.get_ident().map(ToString::to_string).unwrap_or_default();
+        match path.as_str() {
+            "allow_self" => filters.allow_self = true,
+            "allow_system" | "system" => filters.allow_system = true,
+            "allow_edits" | "edits" => filters.allow_edits = true,
+            "allow_bots" | "bots" => filters.allow_bots = true,
+            "mentions_me" => filters.mentions_me = true,
+            "prefix" => filters.prefix = Some(meta.value()?.parse()?),
+            "room" => filters.room = Some(meta.value()?.parse()?),
+            "admin" => {
+                filters.authority = Some(quote! { ::rocketsocket::filter::Authority::Admin });
+            }
+            "room_admin" => {
+                filters.authority = Some(quote! { ::rocketsocket::filter::Authority::RoomAdmin });
+            }
+            "any_admin" => {
+                filters.authority =
+                    Some(quote! { ::rocketsocket::filter::Authority::AdminOrRoomAdmin });
+            }
+            // `not_self` is the default, so asking for it is almost certainly a
+            // misunderstanding about which way round the flags work. Say so rather than
+            // accepting it and letting someone believe the opposite flag also exists.
+            "not_self" | "no_self" | "skip_self" => {
+                return Err(meta.error(
+                    "the bot already never hears itself; that is the default. Use \
+                     `allow_self` to opt *in* to seeing your own events",
+                ));
+            }
+            "skip_edits" | "no_edits" | "skip_system" | "no_system" | "no_bots" => {
+                return Err(meta.error(
+                    "this is already the default; the flags name what to allow, not what \
+                     to block",
+                ));
+            }
+            other => {
+                return Err(meta.error(format!(
+                    "unknown filter `{other}`; expected one of allow_self, allow_system, \
+                     allow_edits, allow_bots, mentions_me, prefix = \"..\", room = \"..\", \
+                     admin, room_admin, any_admin"
+                )));
+            }
+        }
+        Ok(())
+    });
+
+    syn::parse::Parser::parse(parser, args)?;
+    Ok(filters)
+}
+
+impl Filters {
+    /// Renders the runtime value.
+    fn render(&self) -> proc_macro2::TokenStream {
+        let allow_self = self.allow_self;
+        let allow_system = self.allow_system;
+        let allow_edits = self.allow_edits;
+        let allow_bots = self.allow_bots;
+        let mentions_me = self.mentions_me;
+        let prefix = match &self.prefix {
+            Some(literal) => quote! { ::std::option::Option::Some(#literal) },
+            None => quote! { ::std::option::Option::None },
+        };
+        let room = match &self.room {
+            Some(literal) => quote! { ::std::option::Option::Some(#literal) },
+            None => quote! { ::std::option::Option::None },
+        };
+        let authority = self
+            .authority
+            .clone()
+            .unwrap_or_else(|| quote! { ::rocketsocket::filter::Authority::Anyone });
+
+        quote! {
+            ::rocketsocket::filter::Filters::DEFAULT
+                .allow_self(#allow_self)
+                .allow_system(#allow_system)
+                .allow_edits(#allow_edits)
+                .allow_bots(#allow_bots)
+                .mentions_me(#mentions_me)
+                .prefix(#prefix)
+                .room(#room)
+                .authority(#authority)
+        }
+    }
+}
+
+fn expand(function: ItemFn, filters: Filters) -> syn::Result<proc_macro2::TokenStream> {
     if function.sig.asyncness.is_none() {
         return Err(syn::Error::new(
             function.sig.fn_token.span(),
@@ -103,6 +205,7 @@ fn expand(function: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let types: Vec<&Type> = parameters.iter().map(|parameter| &*parameter.ty).collect();
     let bindings: Vec<_> = (0..types.len()).map(|index| format_ident!("__arg{index}")).collect();
     let data = infer_data_type(&types)?;
+    let filters = filters.render();
 
     Ok(quote! {
         #(#attributes)*
@@ -111,6 +214,7 @@ fn expand(function: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 
             ::rocketsocket::framework::Handler::new(
                 ::std::stringify!(#name),
+                #filters,
                 |__event, __context| {
                     let __context = ::std::clone::Clone::clone(__context);
                     let __extracted =

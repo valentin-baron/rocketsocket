@@ -1,0 +1,13 @@
+error: the bot already never hears itself; that is the default. Use `allow_self` to opt *in* to seeing your own events
+ --> tests/ui/inverted_filter.rs:8:23
+  |
+8 | #[rocketsocket::event(not_self)]
+  |                       ^^^^^^^^
+
+warning: unused imports: `Context` and `MessageCreate`
+ --> tests/ui/inverted_filter.rs:4:31
+  |
+4 | use rocketsocket::framework::{Context, MessageCreate};
+  |                               ^^^^^^^  ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

@@ -135,12 +135,13 @@ impl<D> FromEvent<D> for State<D> {
 #[derive(Clone)]
 pub struct Handler<D> {
     name: &'static str,
+    filters: crate::filter::Filters,
     call: fn(&ClientEvent, &Context<D>) -> HandlerFuture<'static>,
 }
 
 impl<D> std::fmt::Debug for Handler<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Handler").field("name", &self.name).finish()
+        f.debug_struct("Handler").field("name", &self.name).field("filters", &self.filters).finish()
     }
 }
 
@@ -149,9 +150,16 @@ impl<D> Handler<D> {
     #[must_use]
     pub fn new(
         name: &'static str,
+        filters: crate::filter::Filters,
         call: fn(&ClientEvent, &Context<D>) -> HandlerFuture<'static>,
     ) -> Self {
-        Self { name, call }
+        Self { name, filters, call }
+    }
+
+    /// The filters this handler was declared with.
+    #[must_use]
+    pub fn filters(&self) -> &crate::filter::Filters {
+        &self.filters
     }
 
     /// The handler's name, for logs.
@@ -175,13 +183,22 @@ impl<D> Handler<D> {
 pub struct Framework<D> {
     handlers: Vec<Handler<D>>,
     context: Context<D>,
+    /// The bot's own user id, resolved once.
+    ///
+    /// Every message event needs it for the self-filter, and it never changes for the life
+    /// of the connection, so fetching it per event would be a REST round trip per message.
+    me: tokio::sync::OnceCell<Option<rocketsocket_model::UserId>>,
 }
 
 impl<D: Send + Sync + 'static> Framework<D> {
     /// Builds a framework over a bot and its state.
     #[must_use]
     pub fn new(bot: crate::Bot, data: D) -> Self {
-        Self { handlers: Vec::new(), context: Context::new(bot, Arc::new(data)) }
+        Self {
+            handlers: Vec::new(),
+            context: Context::new(bot, Arc::new(data)),
+            me: tokio::sync::OnceCell::new(),
+        }
     }
 
     /// Registers a handler.
@@ -227,9 +244,62 @@ impl<D: Send + Sync + 'static> Framework<D> {
     /// wants concurrency can spawn around this.
     pub async fn dispatch(&self, event: &ClientEvent) {
         for handler in &self.handlers {
+            // Filters run before extraction, and before the handler body. A handler that
+            // never sees its own events cannot loop, whatever its body does.
+            if let Some(reason) = self.filtered(handler, event).await {
+                tracing::trace!(handler = handler.name(), ?reason, "event filtered out");
+                continue;
+            }
             if let Err(error) = handler.call(event, &self.context).await {
                 tracing::warn!(handler = handler.name(), %error, "handler failed");
             }
+        }
+    }
+
+    /// Applies one handler's filters to an event.
+    async fn filtered(
+        &self,
+        handler: &Handler<D>,
+        event: &ClientEvent,
+    ) -> Option<crate::filter::Filtered> {
+        let filters = handler.filters();
+
+        // Only message-shaped events carry an author and a room, so only they can be
+        // filtered. Anything else passes: a lifecycle event has nobody to blame.
+        let ClientEvent::Stream { event, .. } = event else {
+            return None;
+        };
+        let (message, room) = match event {
+            StreamEvent::MyMessage { message, .. } => (&**message, &message.rid),
+            StreamEvent::RoomMessage { message, room } => (&**message, room),
+            _ => return None,
+        };
+
+        let me = self.me.get_or_init(|| self.context.bot().user_id()).await.as_ref();
+        if let Some(reason) = filters.local_verdict(message, room, me) {
+            return Some(reason);
+        }
+
+        self.authority_verdict(filters, message, room).await
+    }
+
+    /// Applies the role requirement, which needs the server.
+    ///
+    /// Left unimplemented for now: `Authority::Anyone` is the default and needs no lookup,
+    /// and the role-backed variants are being built against `users.info` and `rooms.roles`
+    /// with memoisation, since a naive implementation is a REST call per message and the
+    /// default limiter allows ten per minute per route.
+    async fn authority_verdict(
+        &self,
+        filters: &crate::filter::Filters,
+        _message: &rocketsocket_model::entity::Message,
+        _room: &rocketsocket_model::RoomId,
+    ) -> Option<crate::filter::Filtered> {
+        match filters.authority {
+            crate::filter::Authority::Anyone => None,
+            // Fail closed: a requirement we cannot yet evaluate must reject, never admit.
+            // Admitting would silently hand an unprivileged user an admin-only handler.
+            _ => Some(crate::filter::Filtered::Authority),
         }
     }
 }
@@ -453,5 +523,91 @@ mod tests {
     /// A `Bot` that is never used for IO — the extractors under test never touch it.
     fn fake_bot() -> crate::Bot {
         crate::Bot::for_tests()
+    }
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static FIRST: AtomicU32 = AtomicU32::new(0);
+    static SECOND: AtomicU32 = AtomicU32::new(0);
+    static GUARDED: AtomicU32 = AtomicU32::new(0);
+    static ADMIN_ONLY: AtomicU32 = AtomicU32::new(0);
+
+    /// `Handler` stores a plain fn pointer, so each test handler is its own fn incrementing
+    /// its own counter. Cheap, and it keeps `Handler` free of boxed closures.
+    macro_rules! counting_handler {
+        ($name:literal, $counter:ident, $filters:expr) => {
+            Handler::<()>::new($name, $filters, |_event, _context| {
+                $counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(()) })
+            })
+        };
+    }
+
+    fn edited_message_event() -> ClientEvent {
+        let args = vec![
+            json!({
+                "_id": "m1", "rid": "GENERAL", "msg": "edited",
+                "ts": {"$date": 1_755_529_012_345_i64},
+                "u": {"_id": "u1", "username": "alice"},
+                "_updatedAt": {"$date": 1_755_529_012_999_i64},
+                "editedAt": {"$date": 1_755_529_012_999_i64},
+                "editedBy": {"_id": "u1", "username": "alice"}
+            }),
+            json!({"roomParticipant": true, "roomType": "c", "roomName": "general"}),
+        ];
+        ClientEvent::Stream {
+            key: StreamKey::new("room-messages", "__my_messages__"),
+            event: StreamEvent::decode("room-messages", "__my_messages__", &args),
+            args,
+        }
+    }
+
+    #[tokio::test]
+    async fn several_handlers_can_take_the_same_event_under_different_names() {
+        // Event identity is the parameter *type*, so the function name is free. discord.py
+        // dispatches on the name, which makes two handlers for one event collide.
+        let framework = Framework::new(fake_bot(), ())
+            .handler(counting_handler!("first", FIRST, crate::filter::Filters::DEFAULT))
+            .handler(counting_handler!("second", SECOND, crate::filter::Filters::DEFAULT));
+
+        assert_eq!(framework.len(), 2);
+        framework.dispatch(&message_event("hi")).await;
+
+        assert_eq!(FIRST.load(Ordering::SeqCst), 1);
+        assert_eq!(SECOND.load(Ordering::SeqCst), 1, "both handlers must see the same event");
+    }
+
+    #[tokio::test]
+    async fn an_edit_rebroadcast_is_filtered_before_the_handler_runs() {
+        // Half the loop guard, and the half that needs no server: any mutation -- a
+        // reaction on the bot's own reply, a pin, a thread bump -- re-sends the whole
+        // document with `editedAt` set. A handler that replies to everything it sees would
+        // otherwise answer its own reply's reaction.
+        let framework = Framework::new(fake_bot(), ()).handler(counting_handler!(
+            "guarded",
+            GUARDED,
+            crate::filter::Filters::DEFAULT
+        ));
+
+        framework.dispatch(&edited_message_event()).await;
+        assert_eq!(GUARDED.load(Ordering::SeqCst), 0, "an edit must not reach a handler");
+
+        framework.dispatch(&message_event("hi")).await;
+        assert_eq!(GUARDED.load(Ordering::SeqCst), 1, "an ordinary message still gets through");
+    }
+
+    #[tokio::test]
+    async fn a_role_requirement_fails_closed_while_unevaluatable() {
+        // Admitting an unevaluatable requirement would hand an unprivileged user an
+        // admin-only handler. Rejecting merely makes the handler quiet.
+        let filters = crate::filter::Filters {
+            authority: crate::filter::Authority::Admin,
+            ..crate::filter::Filters::DEFAULT
+        };
+        let framework =
+            Framework::new(fake_bot(), ()).handler(counting_handler!("admin", ADMIN_ONLY, filters));
+
+        framework.dispatch(&message_event("hi")).await;
+        assert_eq!(ADMIN_ONLY.load(Ordering::SeqCst), 0);
     }
 }

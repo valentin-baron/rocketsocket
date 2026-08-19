@@ -313,6 +313,42 @@ slash-first design. The prefix-command machinery — prefix and mention triggers
 parsing with converters, `#[rest]` trailing capture, subcommands, aliases, cooldowns,
 checks, help generation — is not a legacy compatibility layer here. It is the product.
 
+
+## 7a. Filters — safe by default, dangerous by opt-in
+
+The characteristic way to break a Rocket.Chat bot is a feedback loop, and Rocket.Chat makes
+it easier to hit than most platforms for three reasons that are not obvious:
+
+1. **No trustworthy "is a bot" flag.** `IMessage.bot` is deprecated, never set for bot-role
+   users, and only populated by integrations — so the obvious guard does not work.
+2. **Any mutation re-broadcasts the whole message.** Reactions, pins, thread-count bumps and
+   link-preview enrichment all resend the full document. A handler that replies to every
+   message it sees will reply again when someone reacts to its reply.
+3. **System messages share the stream**, with an empty or repurposed `msg`.
+
+So `#[event]` filters, and **the defaults are the safe ones**. A bare `#[event]` never sees
+the bot's own events, never sees edits or re-broadcasts, never sees system messages. The
+flags are named for what they *allow*, so the absence of arguments is the conservative
+configuration rather than the permissive one:
+
+```rust
+#[rocketsocket::event]                              // safe: no loops possible
+#[rocketsocket::event(prefix = "!echo ")]           // + text match
+#[rocketsocket::event(mentions_me, room = "GENERAL")]
+#[rocketsocket::event(admin)]                       // author must be a server admin
+#[rocketsocket::event(room_admin)]                  // owner/moderator/leader in that room
+#[rocketsocket::event(allow_self, allow_edits)]     // opt *in* to the dangerous behaviour
+```
+
+Writing `#[event(not_self)]` is a **compile error**, not a no-op. Accepting it would let
+someone conclude that the guard is opt-in and that a bare `#[event]` is therefore unsafe —
+the error says the opposite explicitly.
+
+Filters run **before** extraction and before the handler body, so a handler that cannot hear
+itself cannot loop whatever its body does. Role filters **fail closed**: a lookup that
+errors or times out rejects. Admitting on failure would silently hand an unprivileged user
+an admin-only handler; rejecting merely makes the handler quiet.
+
 ## 8. Errors
 
 Errors follow poise: one `#[non_exhaustive] FrameworkError` covering every phase (setup,

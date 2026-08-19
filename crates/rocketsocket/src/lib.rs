@@ -55,6 +55,7 @@ pub use rocketsocket_rest as rest;
 mod bot;
 
 #[cfg(all(feature = "realtime", feature = "rest"))]
+pub mod filter;
 pub mod framework;
 
 #[cfg(all(feature = "realtime", feature = "rest"))]
