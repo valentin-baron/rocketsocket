@@ -786,9 +786,9 @@ Plan explicitly for **9.0**, which will remove the ~116 deprecated methods, the 
 
 | # | Deliverable | Exit criteria |
 |---|---|---|
-| **M0** | Workspace skeleton, CI, `rocketsocket-model` frame types | DDP frames round-trip; fuzz corpus of real captures decodes without panic |
-| **M1** | `rocketsocket-realtime` connection actor | connect → login(resume) → sub → receive; reconnect with resubscribe survives a server restart under test |
-| **M2** | `rocketsocket-rest` + auth unification | one credential drives both transports; PAT and password paths both work |
+| **M0** ✅ | Workspace skeleton, CI, `rocketsocket-model` frame types | DDP frames round-trip; fuzz corpus of real captures decodes without panic |
+| **M1** ✅ | `rocketsocket-realtime` connection actor | connect → login(resume) → sub → receive; reconnect with resubscribe survives a server restart under test |
+| **M2** ✅ | `rocketsocket-rest` + auth unification | one credential drives both transports; PAT and password paths both work |
 | **M3** | `rocketsocket-codegen` + generated event enum | every stream in `streams.ts` has a typed variant; regeneration is a CI job |
 | **M4** | Event layer: `Stream`, generated `EventHandler`, `Standby` | echo bot in <30 lines; `MessageEvent` correctly classifies new/edit/delete/system |
 | **M5** | `rocketsocket-cache` | rooms/users/messages cached; `ResourceType` gating verified; no deadlock under concurrent update+read |
@@ -796,7 +796,7 @@ Plan explicitly for **9.0**, which will remove the ~116 deprecated methods, the 
 | **M6b** | ~~`#[command]` + `#[cog]`~~ — **cut**, see docs/dx.md §7 | text commands stay user-space: parse them in an `#[event]` handler |
 | **M7** | Docs, examples, 0.1 release | published to crates.io with the landmine list as a "Gotchas" doc page |
 
-Integration testing throughout against a **Dockerised Rocket.Chat** — pinned to 7.x and
+Integration testing throughout against a **Dockerised Rocket.Chat** (`docker-compose.test.yml`, `cargo test -- --ignored`; written but **not yet executed** — no Docker daemon in the build environment) — pinned to 7.x and
 latest 8.x, and ideally one microservices deployment to exercise the `ddp-streamer`
 divergences, which no amount of unit testing will catch.
 
