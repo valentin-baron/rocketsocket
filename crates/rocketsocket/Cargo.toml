@@ -30,7 +30,9 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+futures-util = { workspace = true, features = ["sink", "std"] }
+tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde_json.workspace = true
 
