@@ -10,6 +10,7 @@ pub mod connection;
 pub mod correlate;
 pub mod liveness;
 pub mod session;
+pub mod standby;
 pub mod subscription;
 
 pub use self::backoff::Backoff;
@@ -17,4 +18,5 @@ pub use self::client::{Client, ClientEvent, ClientEvents};
 pub use self::correlate::{CallError, Correlator, Epoch, Resolution};
 pub use self::liveness::{Liveness, LivenessPolicy};
 pub use self::session::{Action, Fatal, Phase, Session};
+pub use self::standby::{Canceled, Standby};
 pub use self::subscription::{Registry, StreamKey, SubState};

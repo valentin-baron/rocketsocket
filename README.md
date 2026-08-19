@@ -70,8 +70,9 @@ in 8.0, an event the server stopped emitting in 6.0, and a 2FA message that does
 the codebase. Everything here is derived from the server source instead, with the specific
 divergences recorded in [PLAN.md](PLAN.md) §10.
 
-[PLAN.md](PLAN.md) is the architecture and the research behind it; [docs/dx.md](docs/dx.md)
-is the API design.
+[docs/gotchas.md](docs/gotchas.md) collects the Rocket.Chat behaviours that cost a day each —
+useful whatever language you write a bot in. [PLAN.md](PLAN.md) is the architecture and the
+research behind it; [docs/dx.md](docs/dx.md) is the API design.
 
 ## License
 
