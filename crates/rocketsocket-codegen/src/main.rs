@@ -7,7 +7,7 @@
 //! ```
 
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use rocketsocket_codegen::{
     Catalog, KeyPattern, UPSTREAM_COMMIT, UPSTREAM_PATH, UPSTREAM_VERSION, VENDORED_STREAMS_TS,
@@ -53,10 +53,22 @@ fn main() -> ExitCode {
         }
     };
 
-    let updated = match splice(&existing, &render_catalog(&catalog)) {
+    let spliced = match splice(&existing, &render_catalog(&catalog)) {
         Ok(text) => text,
         Err(error) => {
             eprintln!("error: {error} ({})", target.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Format before comparing. Without this the generated region would be rustfmt-unstable,
+    // and `--check` and `cargo fmt --all --check` would each fail whenever the other had last
+    // been run.
+    let updated = match rustfmt(&spliced) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("error: could not run rustfmt over the generated file: {error}");
+            eprintln!("rustfmt is declared a required component in rust-toolchain.toml");
             return ExitCode::FAILURE;
         }
     };
@@ -75,16 +87,51 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     println!("\nwrote {}", target.display());
-    println!("run `cargo fmt --all` if the generated region needs reformatting");
+    println!("the output is already rustfmt-formatted; review it as you would source");
     ExitCode::SUCCESS
+}
+
+/// Runs the generated text through rustfmt, so the committed output is byte-stable under
+/// `cargo fmt --all --check`.
+///
+/// Via a temporary file rather than a pipe: the input is ~100 KiB, more than a pipe buffer
+/// holds, and feeding it to a child's stdin while the child writes back can deadlock.
+fn rustfmt(source: &str) -> std::io::Result<String> {
+    let scratch =
+        std::env::temp_dir().join(format!("rocketsocket-codegen-{}.rs", std::process::id()));
+    std::fs::write(&scratch, source)?;
+    let status = Command::new(std::env::var_os("RUSTFMT").unwrap_or_else(|| "rustfmt".into()))
+        .arg("--edition")
+        .arg("2024")
+        .arg("--config-path")
+        .arg(workspace_root())
+        .arg(&scratch)
+        .status();
+    let formatted = match status {
+        Ok(status) if status.success() => std::fs::read_to_string(&scratch),
+        Ok(status) => Err(std::io::Error::other(format!("rustfmt exited with {status}"))),
+        Err(error) => Err(error),
+    };
+    let _ = std::fs::remove_file(&scratch);
+    formatted
+}
+
+/// Repository root, where `rustfmt.toml` lives.
+fn workspace_root() -> PathBuf {
+    crates_dir().parent().expect("`crates/` always has a parent").to_path_buf()
 }
 
 /// The file whose generated region this tool owns.
 fn target_path() -> PathBuf {
+    crates_dir().join("rocketsocket-model/src/event.rs")
+}
+
+/// The `crates/` directory holding this crate.
+fn crates_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../rocketsocket-model/src/event.rs")
-        .components()
-        .collect()
+        .parent()
+        .expect("the manifest directory always has a parent")
+        .to_path_buf()
 }
 
 /// Prints what was parsed, so drift against the pinned copy is visible in the build log.
@@ -92,11 +139,7 @@ fn report(catalog: &Catalog) {
     println!("rocketsocket-codegen");
     println!("  source   {UPSTREAM_PATH}");
     println!("  pinned   {UPSTREAM_COMMIT} ({UPSTREAM_VERSION})");
-    println!(
-        "  parsed   {} streams, {} events\n",
-        catalog.streams.len(),
-        catalog.event_count()
-    );
+    println!("  parsed   {} streams, {} events\n", catalog.streams.len(), catalog.event_count());
 
     let width = catalog.streams.iter().map(|s| s.name.len()).max().unwrap_or(0);
     for stream in &catalog.streams {

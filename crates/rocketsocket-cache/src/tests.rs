@@ -748,6 +748,11 @@ async fn a_write_proceeds_once_no_guard_is_held() {
 async fn concurrent_readers_and_writers_do_not_deadlock() {
     let cache = Arc::new(Cache::new());
     cache.set_current_user(user(json!({"_id": "me", "username": "bot"})));
+    // Seeded before the readers start, so a missing index entry below means a writer lost
+    // it rather than that no writer has run yet.
+    cache.update(&room(json!({
+        "_id": "r1", "_updatedAt": {"$date": 0}, "t": "c", "name": "general",
+    })));
 
     let mut tasks = Vec::new();
 

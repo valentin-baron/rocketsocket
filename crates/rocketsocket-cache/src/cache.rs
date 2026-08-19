@@ -153,6 +153,13 @@ impl Cache {
     /// indexed: for a discussion or a team it holds a display name that is not unique, and
     /// for a room created with `UI_Allow_room_names_with_special_chars` it is the
     /// unnormalized form the server itself does not look rooms up by.
+    ///
+    /// The index is updated just after the room itself, not atomically with it. A reader
+    /// racing a writer can therefore see a room through [`Cache::room`] a moment before
+    /// its name resolves here, and two concurrent renames of the same room can leave the
+    /// index pointing at the older of the two names until the next update carries one. The
+    /// alternative — one lock over both maps — would serialize the hottest read in the
+    /// crate behind every write, which is a worse trade for a cache.
     #[must_use]
     pub fn room_id_by_name(&self, name: &str) -> Option<RoomId> {
         self.rooms_by_name.get(name).map(|entry| entry.value().clone())
@@ -234,6 +241,9 @@ impl Cache {
     /// Matching is exact and case-sensitive. Note that Rocket.Chat usernames are unique
     /// case-insensitively, so a lookup with the wrong case misses a user the server would
     /// have found.
+    ///
+    /// As with [`Cache::room_id_by_name`], the index is updated just after the document and
+    /// not atomically with it.
     #[must_use]
     pub fn user_id_by_username(&self, username: &str) -> Option<UserId> {
         self.users_by_username.get(username).map(|entry| entry.value().clone())

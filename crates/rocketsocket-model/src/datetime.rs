@@ -10,6 +10,7 @@
 //! whole message. Decoding `$date` wherever it appears is correct for both.
 
 use core::fmt;
+use std::borrow::Cow;
 
 use serde::de::{self, MapAccess, Unexpected, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -146,7 +147,11 @@ impl<'de> Visitor<'de> for TimestampVisitor {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut found: Option<Option<Timestamp>> = None;
 
-        while let Some(key) = map.next_key::<&str>()? {
+        // `Cow`, not `&str`: a borrowed key can only be produced by a borrowing
+        // deserializer, so `next_key::<&str>()` makes every timestamped entity fail under
+        // `serde_json::from_value` — which is how anyone building a payload with `json!`
+        // or re-deserializing a `Value` will reach these types.
+        while let Some(key) = map.next_key::<Cow<'_, str>>()? {
             if key == "$date" {
                 // The value is itself permissive: RC has shipped `$date` as millis, and
                 // PATs carry no expiry at all, which surfaces as an explicit null.
@@ -300,5 +305,29 @@ mod tests {
             let json = serde_json::to_string(&w).unwrap();
             assert_eq!(serde_json::from_str::<W>(&json).unwrap(), w);
         }
+    }
+
+    #[test]
+    fn decodes_from_a_value_as_well_as_from_a_string() {
+        // `from_value` hands out owned keys. Requiring a borrowed one made every entity
+        // carrying a timestamp undeserializable from a `serde_json::Value`, which is the
+        // natural path for anything built with `json!` or re-read from a cache.
+        let value = serde_json::json!({ "$date": 1_755_529_012_345_i64 });
+        let from_value: Timestamp = serde_json::from_value(value.clone()).expect("from_value");
+        let from_str: Timestamp = serde_json::from_str(&value.to_string()).expect("from_str");
+        assert_eq!(from_value, from_str);
+        assert_eq!(from_value.unix_millis(), 1_755_529_012_345);
+    }
+
+    #[test]
+    fn the_option_adapter_also_works_from_a_value() {
+        #[derive(Deserialize)]
+        struct W(#[serde(with = "super::option")] Option<Timestamp>);
+
+        let w: W = serde_json::from_value(serde_json::json!({ "$date": null })).expect("null");
+        assert_eq!(w.0, None);
+
+        let w: W = serde_json::from_value(serde_json::json!({ "$date": 5 })).expect("value");
+        assert_eq!(w.0.unwrap().unix_millis(), 5);
     }
 }

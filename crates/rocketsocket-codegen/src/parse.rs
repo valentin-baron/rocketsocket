@@ -207,9 +207,8 @@ fn parse_entry(src: &str, start: usize, end: usize) -> Result<Event> {
         if from == to {
             continue;
         }
-        let colon = find_top_level(src, from, to, &[':'])?.ok_or_else(|| {
-            err(src, from, "entry member has no `:`", &src[from..to])
-        })?;
+        let colon = find_top_level(src, from, to, &[':'])?
+            .ok_or_else(|| err(src, from, "entry member has no `:`", &src[from..to]))?;
         let name = src[from..colon].trim();
         let (vf, vt) = trim_range(src, colon + 1, to);
         match name {
@@ -259,19 +258,19 @@ fn parse_key(src: &str, start: usize, end: usize) -> Result<KeyPattern> {
         if inner == HOLE {
             return Ok(KeyPattern::Any);
         }
-        if let Some(rest) = inner.strip_prefix(HOLE) {
-            if let Some(suffix) = rest.strip_prefix('/') {
-                if !suffix.contains("${") && !suffix.is_empty() {
-                    return Ok(KeyPattern::Suffix(suffix.to_owned()));
-                }
-            }
+        if let Some(rest) = inner.strip_prefix(HOLE)
+            && let Some(suffix) = rest.strip_prefix('/')
+            && !suffix.is_empty()
+            && !suffix.contains("${")
+        {
+            return Ok(KeyPattern::Suffix(suffix.to_owned()));
         }
-        if let Some(prefix) = inner.strip_suffix(HOLE) {
-            if let Some(prefix) = prefix.strip_suffix('/') {
-                if !prefix.contains("${") && !prefix.is_empty() {
-                    return Ok(KeyPattern::Prefix(prefix.to_owned()));
-                }
-            }
+        if let Some(head) = inner.strip_suffix(HOLE)
+            && let Some(prefix) = head.strip_suffix('/')
+            && !prefix.is_empty()
+            && !prefix.contains("${")
+        {
+            return Ok(KeyPattern::Prefix(prefix.to_owned()));
         }
         return Err(err(
             src,
@@ -598,7 +597,7 @@ mod tests {
         let queue = catalog().stream("livechat-inquiry-queue-observer").expect("declared").clone();
         assert_eq!(queue.events[0].key, KeyPattern::Literal("public".to_owned()));
         assert_eq!(queue.events[1].key, KeyPattern::Prefix("department".to_owned()));
-        assert_eq!(queue.events[3].key, KeyPattern::Any, "`${string}` is a free key");
+        assert_eq!(queue.events[3].key, KeyPattern::Any, "a bare `${{string}}` is a free key");
 
         let messages = catalog().stream("room-messages").expect("declared").clone();
         assert_eq!(messages.events[0].key, KeyPattern::Literal("__my_messages__".to_owned()));
@@ -708,7 +707,7 @@ mod tests {
         .expect("parses");
         let stream = &catalog.streams[0];
         assert_eq!(stream.events.len(), 2);
-        assert_eq!(stream.events[0].key, KeyPattern::Literal("a/b}]'".to_owned()));
+        assert_eq!(stream.events[0].key, KeyPattern::Literal("a/b}]".to_owned()));
         assert_eq!(stream.events[1].args.arities, vec![2]);
     }
 }

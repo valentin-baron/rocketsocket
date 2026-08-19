@@ -108,10 +108,10 @@ use crate::protocol;
 ///
 /// This is an *index*, not a decoder. It answers "does this workspace's server
 /// version declare this (stream, event) pair, and how many positional arguments
-/// does it promise?" — which is what makes upstream drift visible: the tests in
-/// this module assert that every stream [`StreamEvent`] types is still here, so a
-/// stream that disappears upstream fails the build instead of quietly becoming
-/// dead code.
+/// does it promise?" — which is what makes upstream drift visible: a test in
+/// this module asserts that every `(stream, event)` pair [`StreamEvent`] types is
+/// still declared here, so an event that disappears upstream fails the build
+/// instead of quietly becoming one the bot never receives again.
 ///
 /// It is *not* the authority on what the server actually sends; see the module
 /// docs for where the declared types and the emit site disagree.
@@ -184,12 +184,12 @@ pub mod catalog {
         pub fn matches(&self, key: &str) -> bool {
             match *self {
                 Self::Literal(value) => key == value,
-                Self::Suffix(suffix) => {
-                    key.split_once('/').is_some_and(|(head, rest)| !head.is_empty() && rest == suffix)
-                }
-                Self::Prefix(prefix) => {
-                    key.split_once('/').is_some_and(|(head, rest)| head == prefix && !rest.is_empty())
-                }
+                Self::Suffix(suffix) => key
+                    .split_once('/')
+                    .is_some_and(|(head, rest)| !head.is_empty() && rest == suffix),
+                Self::Prefix(prefix) => key
+                    .split_once('/')
+                    .is_some_and(|(head, rest)| head == prefix && !rest.is_empty()),
                 Self::Any => true,
             }
         }
@@ -211,14 +211,12 @@ pub mod catalog {
     pub const STREAMS: &[StreamSpec] = &[
         StreamSpec {
             name: "roles",
-            events: &[
-                EventSpec {
-                    key: KeyPattern::Literal("roles"),
-                    arities: &[1],
-                    variadic: false,
-                    args: "[ IRole & { type: 'inserted' | 'updated' | 'removed' | 'changed'; }, ]",
-                },
-            ],
+            events: &[EventSpec {
+                key: KeyPattern::Literal("roles"),
+                arities: &[1],
+                variadic: false,
+                args: "[ IRole & { type: 'inserted' | 'updated' | 'removed' | 'changed'; }, ]",
+            }],
         },
         StreamSpec {
             name: "notify-room",
@@ -428,14 +426,12 @@ pub mod catalog {
         },
         StreamSpec {
             name: "importers",
-            events: &[
-                EventSpec {
-                    key: KeyPattern::Literal("progress"),
-                    arities: &[1],
-                    variadic: false,
-                    args: "[{ rate: number } | IImportProgress]",
-                },
-            ],
+            events: &[EventSpec {
+                key: KeyPattern::Literal("progress"),
+                arities: &[1],
+                variadic: false,
+                args: "[{ rate: number } | IImportProgress]",
+            }],
         },
         StreamSpec {
             name: "notify-logged",
@@ -528,14 +524,12 @@ pub mod catalog {
         },
         StreamSpec {
             name: "room-data",
-            events: &[
-                EventSpec {
-                    key: KeyPattern::Any,
-                    arities: &[1],
-                    variadic: false,
-                    args: "[IOmnichannelRoom | Pick<IOmnichannelRoom, '_id'>]",
-                },
-            ],
+            events: &[EventSpec {
+                key: KeyPattern::Any,
+                arities: &[1],
+                variadic: false,
+                args: "[IOmnichannelRoom | Pick<IOmnichannelRoom, '_id'>]",
+            }],
         },
         StreamSpec {
             name: "notify-room-users",
@@ -556,47 +550,39 @@ pub mod catalog {
         },
         StreamSpec {
             name: "livechat-room",
-            events: &[
-                EventSpec {
-                    key: KeyPattern::Any,
-                    arities: &[1],
-                    variadic: false,
-                    args: "[ | { type: 'agentStatus'; status: string; } | { type: 'queueData'; data: | { [k: string]: unknown; } | undefined; } | { type: 'agentData'; data: ILivechatAgent | undefined | { hiddenInfo: boolean }; } | { type: 'visitorData'; visitor: unknown; }, ]",
-                },
-            ],
+            events: &[EventSpec {
+                key: KeyPattern::Any,
+                arities: &[1],
+                variadic: false,
+                args: "[ | { type: 'agentStatus'; status: string; } | { type: 'queueData'; data: | { [k: string]: unknown; } | undefined; } | { type: 'agentData'; data: ILivechatAgent | undefined | { hiddenInfo: boolean }; } | { type: 'visitorData'; visitor: unknown; }, ]",
+            }],
         },
         StreamSpec {
             name: "user-presence",
-            events: &[
-                EventSpec {
-                    key: KeyPattern::Any,
-                    arities: &[1],
-                    variadic: false,
-                    args: "[ [ username: string, statusChanged?: PresenceStatusCode, statusText?: string, statusSource?: IUser['statusSource'], statusExpiresAt?: IUser['statusExpiresAt'], ], ]",
-                },
-            ],
+            events: &[EventSpec {
+                key: KeyPattern::Any,
+                arities: &[1],
+                variadic: false,
+                args: "[ [ username: string, statusChanged?: PresenceStatusCode, statusText?: string, statusSource?: IUser['statusSource'], statusExpiresAt?: IUser['statusExpiresAt'], ], ]",
+            }],
         },
         StreamSpec {
             name: "integrationHistory",
-            events: &[
-                EventSpec {
-                    key: KeyPattern::Any,
-                    arities: &[1],
-                    variadic: false,
-                    args: "[ | { type: 'removed'; id: string } | { id: string; diff: unknown; type: 'updated'; } | { type: 'inserted'; data: Partial<IIntegrationHistory>; }, ]",
-                },
-            ],
+            events: &[EventSpec {
+                key: KeyPattern::Any,
+                arities: &[1],
+                variadic: false,
+                args: "[ | { type: 'removed'; id: string } | { id: string; diff: unknown; type: 'updated'; } | { type: 'inserted'; data: Partial<IIntegrationHistory>; }, ]",
+            }],
         },
         StreamSpec {
             name: "canned-responses",
-            events: &[
-                EventSpec {
-                    key: KeyPattern::Literal("canned-responses"),
-                    arities: &[1, 2],
-                    variadic: false,
-                    args: "| [{ type: 'removed'; _id: string }, { agentsId: string }] | [{ type: 'removed'; _id: string }] | [ { type: 'changed' } & Omit<IOmnichannelCannedResponse, '_updatedAt' | '_createdAt'> & { _createdAt?: Date | undefined; }, ] | [{ type: 'changed' } & IOmnichannelCannedResponse, { agentsId: string }]",
-                },
-            ],
+            events: &[EventSpec {
+                key: KeyPattern::Literal("canned-responses"),
+                arities: &[1, 2],
+                variadic: false,
+                args: "| [{ type: 'removed'; _id: string }, { agentsId: string }] | [{ type: 'removed'; _id: string }] | [ { type: 'changed' } & Omit<IOmnichannelCannedResponse, '_updatedAt' | '_createdAt'> & { _createdAt?: Date | undefined; }, ] | [{ type: 'changed' } & IOmnichannelCannedResponse, { agentsId: string }]",
+            }],
         },
         StreamSpec {
             name: "livechat-inquiry-queue-observer",
@@ -765,14 +751,12 @@ pub mod catalog {
         },
         StreamSpec {
             name: "local",
-            events: &[
-                EventSpec {
-                    key: KeyPattern::Literal("broadcast"),
-                    arities: &[],
-                    variadic: true,
-                    args: "any[]",
-                },
-            ],
+            events: &[EventSpec {
+                key: KeyPattern::Literal("broadcast"),
+                arities: &[],
+                variadic: true,
+                args: "any[]",
+            }],
         },
     ];
 
@@ -1453,10 +1437,7 @@ impl StreamEvent {
         if event_name.is_empty() {
             return None;
         }
-        Some(Self::RoomMessage {
-            room: RoomId::new(event_name),
-            message: Box::new(req(args, 0)?),
-        })
+        Some(Self::RoomMessage { room: RoomId::new(event_name), message: Box::new(req(args, 0)?) })
     }
 
     fn notify_room(event_name: &str, args: &[Value]) -> Option<Self> {
@@ -1488,9 +1469,7 @@ impl StreamEvent {
         let (user, key) = split_key(event_name)?;
         let user = UserId::new(user);
         match key {
-            "message" => {
-                Some(Self::EphemeralMessage { user, message: Box::new(req(args, 0)?) })
-            }
+            "message" => Some(Self::EphemeralMessage { user, message: Box::new(req(args, 0)?) }),
             "notification" => {
                 Some(Self::Notification { user, notification: Box::new(req(args, 0)?) })
             }
@@ -1712,8 +1691,11 @@ mod tests {
     #[test]
     fn my_messages_survives_a_missing_or_reshaped_trailing_element() {
         // The declared arity, from a server old enough not to append it.
-        let bare = StreamEvent::decode("stream-room-messages", "__my_messages__", &args(&[message()]));
-        assert!(matches!(&bare, StreamEvent::MyMessage { meta, .. } if *meta == MyMessageMeta::default()));
+        let bare =
+            StreamEvent::decode("stream-room-messages", "__my_messages__", &args(&[message()]));
+        assert!(
+            matches!(&bare, StreamEvent::MyMessage { meta, .. } if *meta == MyMessageMeta::default())
+        );
 
         // The authorization hook is documented as returning `true` on some paths. Losing the
         // annotation is acceptable; losing the message is not.
@@ -2046,7 +2028,9 @@ mod tests {
             "uid1/force_logout",
             &args(&[json!("sess-1")]),
         );
-        assert!(matches!(event, StreamEvent::ForceLogout { session: Some(s), .. } if s == "sess-1"));
+        assert!(
+            matches!(event, StreamEvent::ForceLogout { session: Some(s), .. } if s == "sess-1")
+        );
     }
 
     // -----------------------------------------------------------------------------------
@@ -2076,7 +2060,9 @@ mod tests {
             "user-status",
             &args(&[json!(["uid1", "john", 2, "Away for lunch", "John Doe", ["user", "bot"]])]),
         );
-        let StreamEvent::UserStatusChanged(status) = six else { panic!("expected UserStatusChanged") };
+        let StreamEvent::UserStatusChanged(status) = six else {
+            panic!("expected UserStatusChanged")
+        };
         assert_eq!(status.status, PresenceStatus::Away);
         assert_eq!(status.status_text.as_deref(), Some("Away for lunch"));
         assert_eq!(status.name.as_deref(), Some("John Doe"));
@@ -2222,11 +2208,7 @@ mod tests {
             // A number where the message document belongs.
             ("stream-room-messages", "GENERAL", args(&[json!(42)])),
             // A message missing `rid`, which the model requires.
-            (
-                "stream-room-messages",
-                "__my_messages__",
-                args(&[json!({"_id": "m1", "msg": "x"})]),
-            ),
+            ("stream-room-messages", "__my_messages__", args(&[json!({"_id": "m1", "msg": "x"})])),
             // The username slot holds an object.
             (
                 "stream-notify-room",
@@ -2317,8 +2299,12 @@ mod tests {
         assert_eq!(keyed.room().map(RoomId::as_str), Some("GENERAL"));
         assert_eq!(mine.room().map(RoomId::as_str), Some("GENERAL"), "taken from the document");
         assert_eq!(
-            StreamEvent::decode("stream-notify-logged", "user-status", &args(&[json!(["u", "n", 1])]))
-                .room(),
+            StreamEvent::decode(
+                "stream-notify-logged",
+                "user-status",
+                &args(&[json!(["u", "n", 1])])
+            )
+            .room(),
             None,
         );
     }
@@ -2379,10 +2365,7 @@ mod tests {
             Some(catalog::KeyPattern::Literal("__my_messages__")),
             "the literal key must win over the catch-all room-id key that follows it",
         );
-        assert_eq!(
-            stream.event("GENERAL").map(|spec| spec.key),
-            Some(catalog::KeyPattern::Any),
-        );
+        assert_eq!(stream.event("GENERAL").map(|spec| spec.key), Some(catalog::KeyPattern::Any),);
     }
 
     #[test]

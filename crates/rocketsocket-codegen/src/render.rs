@@ -38,12 +38,12 @@ impl Error for RenderError {}
 /// means the target file was restructured and the generator must not guess where its output
 /// belongs.
 pub fn splice(existing: &str, generated: &str) -> Result<String, RenderError> {
-    let begin = existing.find(BEGIN_MARKER).ok_or_else(|| {
-        RenderError(format!("target file has no `{BEGIN_MARKER}` marker"))
-    })?;
-    let end = existing.find(END_MARKER).ok_or_else(|| {
-        RenderError(format!("target file has no `{END_MARKER}` marker"))
-    })?;
+    let begin = existing
+        .find(BEGIN_MARKER)
+        .ok_or_else(|| RenderError(format!("target file has no `{BEGIN_MARKER}` marker")))?;
+    let end = existing
+        .find(END_MARKER)
+        .ok_or_else(|| RenderError(format!("target file has no `{END_MARKER}` marker")))?;
     if end < begin {
         return Err(RenderError("generated-region markers are in the wrong order".to_owned()));
     }
@@ -68,10 +68,10 @@ pub fn render_catalog(catalog: &Catalog) -> String {
          ///\n\
          /// This is an *index*, not a decoder. It answers \"does this workspace's server\n\
          /// version declare this (stream, event) pair, and how many positional arguments\n\
-         /// does it promise?\" — which is what makes upstream drift visible: the tests in\n\
-         /// this module assert that every stream [`StreamEvent`] types is still here, so a\n\
-         /// stream that disappears upstream fails the build instead of quietly becoming\n\
-         /// dead code.\n\
+         /// does it promise?\" — which is what makes upstream drift visible: a test in\n\
+         /// this module asserts that every `(stream, event)` pair [`StreamEvent`] types is\n\
+         /// still declared here, so an event that disappears upstream fails the build\n\
+         /// instead of quietly becoming one the bot never receives again.\n\
          ///\n\
          /// It is *not* the authority on what the server actually sends; see the module\n\
          /// docs for where the declared types and the emit site disagree.\n\
@@ -192,13 +192,8 @@ pub fn render_catalog(catalog: &Catalog) -> String {
                 KeyPattern::Prefix(v) => format!("KeyPattern::Prefix({})", quote(v)),
                 KeyPattern::Any => "KeyPattern::Any".to_owned(),
             };
-            let arities = event
-                .args
-                .arities
-                .iter()
-                .map(usize::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let arities =
+                event.args.arities.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
             let _ = writeln!(out, "                EventSpec {{");
             let _ = writeln!(out, "                    key: {key},");
             let _ = writeln!(out, "                    arities: &[{arities}],");
